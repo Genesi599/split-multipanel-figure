@@ -22,6 +22,12 @@ pip install numpy pillow scipy
 ## 用法
 
 ```bash
+# 一键流程
+python scripts/find_labels.py <image> --out labels.json   # 1. 自动定位标签字母
+python scripts/verify.py <image> labels.json              # 2. 面板归属验证 → crop_boxes.json
+python scripts/autosplit.py <image> outdir --labels labels.json  # 3. 分割+裁剪+验证
+
+# 或分步
 python scripts/autosplit.py <image> <outdir>                        # 第1步: 标签候选 → label_candidates.png
 python scripts/autosplit.py <image> <outdir> --labels <labels.json> # 第2步: 自动分块+画线+crop+验证
 ```
