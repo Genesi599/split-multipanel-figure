@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-纯代码面板标签检测器（无 AI）—— 高度峰法
-原理(已验证):
-  1. 二值化找暗色连通域, 统计每个方块(连通域)的高度
-  2. 找"正文文字高度峰"(最常见高度) = body_h; 标签应显著高于正文
-  3. 筛出 高度>[body_h×1.4] 的方块
-  4. 再过滤: 宽高比 0.6-2.2(排除竖条/长字串), 填充率 0.25-0.95, 孤立(周围无粘连)
-  5. 得到标签候选(位置+尺寸)
+纯代码面板标签检测器 —— 高度筛 + OCR 置信度（无 AI 视觉）
+
+完整流程(已验证, G4/G5 实测):
+  1. 二值化找暗色连通域, 统计方块高度
+  2. 找"正文文字高度峰"(最常见高度) = body_h; 标签显著高于正文
+  3. 筛 高度>[body_h×ratio] + 宽高比0.6-2.2(排除竖条) + 填充率0.25-0.95 + 孤立(周围无粘连)
+     → 得到标签候选(位置+尺寸)
+  4. （可选）用 OCR(EasyOCR) 读每个候选框内容, 取最高置信度
+     → 置信度>conf_thr 的才是真标签, 读出的字母 = 身份
+  5. 输出 {字母: [x,y]} 或候选列表
+
 用法:
-  python label_detect.py <img> [--out labels.json] [--view] [--ratio 1.4]
+  python label_detect.py <img> [--out labels.json] [--ratio 1.5]
+         [--ocr] [--conf 0.8] [--view]
+  --ocr    启用 OCR 确认身份(需要 easyocr)
+  --conf   置信度阈值, 默认0.8
 """
 import sys, json
 import numpy as np
@@ -16,31 +23,35 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 
-def detect(src, ratio=1.4):
+def load(src):
     arr = np.array(Image.open(src).convert('RGB'))
+    return arr
+
+
+def detect_candidates(arr, ratio=1.5, min_area=20, max_area=400):
+    """高度峰筛法定位标签候选框, 返回 (body_h, candidates)"""
     dark = (arr[:, :, 0] < 200) & (arr[:, :, 1] < 200) & (arr[:, :, 2] < 200)
     lab, n = ndimage.label(dark, structure=np.ones((3, 3)))
     sizes = ndimage.sum(dark, lab, range(1, n + 1))
 
-    # 高度直方图: 正文文字 = 最常见高度(数量最多的档, 排除1-2px噪声)
+    # 高度直方图: 正文文字 = 最常见高度(排除大图块)
     from collections import Counter
     hcount = Counter()
     for i in range(1, n + 1):
         ys, xs = np.where(lab == i)
         h = ys.max() - ys.min() + 1
         w = xs.max() - xs.min() + 1
-        if h <= 60 and w <= 60:  # 只统计小方块(文字/字母), 排除大图块
+        if h <= 60 and w <= 60:
             hcount[h] += 1
     if not hcount:
-        return []
-    body_h = hcount.most_common(1)[0][0]  # 正文高度峰
-    min_h = int(body_h * ratio)  # 标签最小高度
+        return None, []
+    body_h = hcount.most_common(1)[0][0]
+    min_h = int(body_h * ratio)
 
-    # 筛高度达标 + 形状像孤立大写字母
     cands = []
     for i in range(1, n + 1):
         s = int(sizes[i - 1])
-        if s < 20 or s > 400:
+        if s < min_area or s > max_area:
             continue
         ys, xs = np.where(lab == i)
         h = ys.max() - ys.min() + 1
@@ -65,32 +76,80 @@ def detect(src, ratio=1.4):
     return body_h, cands
 
 
+def ocr_verify(cands, src, conf_thr=0.8):
+    """用 OCR 读候选框内容, 返回 (真标签{字母:[x,y]}, 保留最大识别字母列表)"""
+    import easyocr
+    reader = easyocr.Reader(['en'], gpu=False)
+    img = Image.open(src).convert('RGB')
+    labels = {}
+    letter_kept = []
+    for i, c in enumerate(cands):
+        x, y, w, h = c['x'], c['y'], c['w'], c['h']
+        pad = 4
+        crop = img.crop((max(0, x - pad), max(0, y - pad), x + w + pad, y + h + pad))
+        crop = crop.resize((max(crop.width * 6, 60), max(crop.height * 6, 60)), Image.LANCZOS)
+        res = reader.readtext(np.array(crop), detail=1,
+                              allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ', paragraph=False)
+        if not res:
+            letter_kept.append((c, '', 0.0))
+            continue
+        box, text, conf = max(res, key=lambda r: r[2])
+        letter_kept.append((c, text.upper().strip(), float(conf)))
+        if conf >= conf_thr and len(text.strip()) == 1:
+            # 按位置先后分配字母(同一label去重: 同字母只留置信度最高)
+            ch = text.strip().upper()
+            labels[ch] = [c['x'], c['y']]
+    return labels, letter_kept
+
+
 def main():
     src = sys.argv[1]
     out = 'labels.json'
-    ratio = 1.4
+    ratio = 1.5
+    use_ocr = '--ocr' in sys.argv
+    conf_thr = 0.8
     view = '--view' in sys.argv
     if '--out' in sys.argv:
         out = sys.argv[sys.argv.index('--out') + 1]
     if '--ratio' in sys.argv:
         ratio = float(sys.argv[sys.argv.index('--ratio') + 1])
-    body_h, cands = detect(src, ratio)
-    print(f'正文高度峰={body_h}px, 标签需>={int(body_h*ratio)}px, 候选{len(cands)}个:')
+    if '--conf' in sys.argv:
+        conf_thr = float(sys.argv[sys.argv.index('--conf') + 1])
+
+    arr = load(src)
+    body_h, cands = detect_candidates(arr, ratio)
+    print(f'正文高度峰={body_h}px, 标签需>={int(body_h*ratio)}px, 候选{len(cands)}个')
     cands.sort(key=lambda c: (c['y'], c['x']))
-    for c in cands:
-        print(f"  ({c['x']:4d},{c['y']:4d}) {c['w']}x{c['h']} area={c['area']}")
-    # 存候选(不含身份)
-    json.dump(cands, open(out, 'w', encoding='utf-8'), indent=1)
-    print('已存', out)
-    if view:
-        arr = np.array(Image.open(src).convert('RGB'))
-        img = Image.fromarray(arr); d = ImageDraw.Draw(img)
+
+    if use_ocr:
+        labels, kept = ocr_verify(cands, src, conf_thr)
+        print(f'OCR 置信度>={conf_thr} 的真标签:')
+        for ch in sorted(labels):
+            print(f'  {ch}: {labels[ch]}')
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(labels, f, indent=1)
+        print('已存', out)
+        if view:
+            img = Image.fromarray(arr); d = ImageDraw.Draw(img)
+            for ch, (x, y) in labels.items():
+                d.ellipse([x - 3, y - 3, x + 12, y + 14], outline=(255, 0, 0), width=2)
+                d.text((x + 1, y + 1), ch, fill=(255, 0, 0))
+            img.save('labels_detect.png')
+            print('已存 labels_detect.png')
+    else:
         for i, c in enumerate(cands):
-            d.rectangle([c['x']-2, c['y']-2, c['x']+c['w']+2, c['y']+c['h']+2],
-                        outline=(255, 0, 0), width=2)
-            d.text((c['x']+2, c['y']-2), str(i), fill=(255, 0, 0))
-        img.save('labels_detect.png')
-        print('已存 labels_detect.png')
+            print(f"  #{i} ({c['x']},{c['y']}) {c['w']}x{c['h']} area={c['area']}")
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(cands, f, indent=1)
+        print('已存', out)
+        if view:
+            img = Image.fromarray(arr); d = ImageDraw.Draw(img)
+            for i, c in enumerate(cands):
+                d.rectangle([c['x']-2, c['y']-2, c['x']+c['w']+2, c['y']+c['h']+2],
+                            outline=(255, 0, 0), width=2)
+                d.text((c['x']+2, c['y']-2), str(i), fill=(255, 0, 0))
+            img.save('labels_detect.png')
+            print('已存 labels_detect.png')
 
 
 if __name__ == '__main__':
