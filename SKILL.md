@@ -97,6 +97,19 @@ E: 左竖+三横 | F: 左竖+双横 | G: 圆+底开口
 
 **触发**：`python scripts/label_detect.py <img> --ocr --conf 0.8 --view`
 
+### 完整流水线（两命令，无需每次手写脚本）
+
+```bash
+# 1. 标签识别 → labels.json
+python scripts/label_detect.py <img> --ocr --out labels.json
+# 2. 分割 → panel_X.png + 色块归属.png + 分割线.png + crop_boxes.json
+python scripts/split_panels.py <img> labels.json --out outdir
+```
+
+`split_panels.py` 自动网格定面板边界（简单布局可行）；**复杂布局**（大底部面板/标签靠下）auto 网格会找错行边界 → 用 `--panels panel.json` 手工给面板框 `{"A":[x0,y0,x1,y1],...}`（标签反推 + 内容间隙）。
+
+**触发**：`python scripts/find_labels.py <img> --out labels.json`
+
 **⚠️ ratio 需按"标签/正文高度差"调整**（G6 实测）：多数图标签=正文高度×1.5（正文8→标签13），ratio 1.5 即可；但有的图标签只比正文高 ~30%（正文9→标签12），ratio 1.5 会把标签滤掉 → 需 ratio 1.3。先看候选数：ratio 1.5 产出 0 候选 = 标签更矮，降到 1.3 再看。候选数刚好 = 面板数最佳。
 
 **⚠️ 暗色阈值/高度范围**：dark 阈值用 `<235`（不是 `<200`，避免图内浅灰线条把文字切碎）；正文高度峰在 5-25px 范围选最常见（排除 1-2px 阴影碎片），`min_h=max(10, body_h×ratio)`。
