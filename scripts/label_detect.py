@@ -30,23 +30,24 @@ def load(src):
 
 def detect_candidates(arr, ratio=1.5, min_area=20, max_area=400):
     """高度峰筛法定位标签候选框, 返回 (body_h, candidates)"""
-    dark = (arr[:, :, 0] < 200) & (arr[:, :, 1] < 200) & (arr[:, :, 2] < 200)
+    dark = (arr[:, :, 0] < 235) & (arr[:, :, 1] < 235) & (arr[:, :, 2] < 235)
     lab, n = ndimage.label(dark, structure=np.ones((3, 3)))
     sizes = ndimage.sum(dark, lab, range(1, n + 1))
 
-    # 高度直方图: 正文文字 = 最常见高度(排除大图块)
+    # 高度直方图: 正文文字 = 最常见高度(在合理范围5-25px内选峰, 排除1-2px阴影碎片)
     from collections import Counter
     hcount = Counter()
     for i in range(1, n + 1):
         ys, xs = np.where(lab == i)
         h = ys.max() - ys.min() + 1
         w = xs.max() - xs.min() + 1
-        if h <= 60 and w <= 60:
+        if 5 <= h <= 25 and w <= 60:
             hcount[h] += 1
     if not hcount:
         return None, []
+    # 正文高度 = 5-25px 内最常见的高度(不是全局最多, 避免1-2px碎块)
     body_h = hcount.most_common(1)[0][0]
-    min_h = int(body_h * ratio)
+    min_h = max(10, int(body_h * ratio))
 
     cands = []
     for i in range(1, n + 1):
