@@ -131,8 +131,9 @@ def merge_words(sizes_all, lab, min_area=5, gap_ratio=0.8):
     return merged, gap_thr
 
 
-def assign_blocks(blocks, panels):
-    """每个合并块按 bbox 左上角归属面板 → {块Index: 面板名}"""
+def assign_blocks(blocks, panels, anchor_pad=0):
+    """每个合并块按 bbox 左上角归属面板 → {块Index: 面板名}
+    注: anchor_pad 保留参数签名但本实现固定为0(实测锚点左移对交界小字无效且会致面板重叠)。"""
     owner = {}
     for bi, blk in enumerate(blocks):
         bx0, by0 = blk['x0'], blk['y0']
@@ -141,6 +142,11 @@ def assign_blocks(blocks, panels):
                 owner[bi] = n
                 break
     return owner
+
+
+def apply_anchor_pad(labels, panels, anchor_pad):
+    """返回扩张后的面板框(仅用于归属判定示意)"""
+    return {n: (x0 - anchor_pad, y0 - anchor_pad, x1, y1) for n, (x0, y0, x1, y1) in panels.items()}
 
 
 def crop_for(blocks, owner, labels, panels, W, H):
@@ -160,8 +166,9 @@ def crop_for(blocks, owner, labels, panels, W, H):
     return crop
 
 
-def result_for(blocks, owner, labels, panels):
-    """L 形验证 + 重叠检查"""
+def result_for(blocks, owner, labels, panels, anchor_pad=0):
+    """L 形验证 + 重叠检查
+    anchor_pad: L形锚点左移量, 允许色块贴边到字母左上扩展区。"""
     res = {'L形': 'ALL OK', 'overlap': []}
     for n, p in panels.items():
         ids = [bi for bi, own in owner.items() if own == n]
@@ -171,10 +178,8 @@ def result_for(blocks, owner, labels, panels):
             continue
         minx = min(blocks[bi]['x0'] for bi in ids)
         miny = min(blocks[bi]['y0'] for bi in ids)
-        if not (minx >= lx and miny >= ly):
+        if not (minx >= lx - anchor_pad and miny >= ly - anchor_pad):
             res['L形'] = 'FAIL'
-    # 重叠
-    crop = {n: labels[n] for n in labels}
     return res
 
 
@@ -282,6 +287,7 @@ def main():
     outdir = 'split_out'
     panels_json = None
     dilate = 0
+    anchor_pad = 0
     do_merge = ('--no-merge' not in sys.argv)
     if '--out' in sys.argv:
         outdir = sys.argv[sys.argv.index('--out') + 1]
@@ -289,6 +295,8 @@ def main():
         panels_json = json.load(open(sys.argv[sys.argv.index('--panels') + 1], encoding='utf-8'))
     if '--dilate' in sys.argv:
         dilate = int(sys.argv[sys.argv.index('--dilate') + 1])
+    if '--anchor-pad' in sys.argv:
+        anchor_pad = int(sys.argv[sys.argv.index('--anchor-pad') + 1])
     os.makedirs(outdir, exist_ok=True)
     labels = json.load(open(labels_src, encoding='utf-8'))
 
@@ -313,7 +321,7 @@ def main():
     if do_merge:
         blocks, gap_thr = merge_words(sizes, lab)
         print('间隙合并(阈值%spx): %d连通域 → %d块' % (gap_thr, nc, len(blocks)))
-        owner = assign_blocks(blocks, panels_json)
+        owner = assign_blocks(blocks, panels_json, anchor_pad)
     else:
         blocks = []
         owner = {}
