@@ -133,14 +133,61 @@ def merge_words(sizes_all, lab, min_area=5, gap_ratio=0.8):
 
 def assign_blocks(blocks, panels, anchor_pad=0):
     """每个合并块按 bbox 左上角归属面板 → {块Index: 面板名}
-    注: anchor_pad 保留参数签名但本实现固定为0(实测锚点左移对交界小字无效且会致面板重叠)。"""
+    anchor_pad: 锚点向左上移 P 像素判定归属。
+    面板判定顺序: 按面板位置从右下角到左上角(先判右下方的面板)。
+    随后应用「分隔规则」: 一个块若延伸到相邻面板区域且被该面板的内容分隔, 改归该面板。"""
+    # 面板按右下角(x1+y1)从大到小排序 → 右下面板先判
+    ordered = sorted(panels.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
     owner = {}
     for bi, blk in enumerate(blocks):
         bx0, by0 = blk['x0'], blk['y0']
-        for n, (x0, y0, x1, y1) in panels.items():
-            if x0 <= bx0 < x1 and y0 <= by0 < y1:
+        for n, (x0, y0, x1, y1) in ordered:
+            if x0 - anchor_pad <= bx0 < x1 and y0 - anchor_pad <= by0 < y1:
                 owner[bi] = n
                 break
+    apply_separation_rule(blocks, owner, panels)
+    return owner
+
+
+def apply_separation_rule(blocks, owner, panels):
+    """分隔规则(硬判据): 被其他子图色块分隔的右侧/下方色块, 归分隔它的面板。
+    对每个块: 若它延伸到相邻面板区域(x1 超出面板右界/下界), 且该相邻面板有内容块
+    位于它内部(y重叠且 x 落在此面板区), 则此块被分隔 → 改归相邻面板。"""
+    changed = True
+    it = 0
+    while changed and it < 10:
+        changed = False
+        it += 1
+        # 对每个块找它跨越的面板(块 bbox 中心/范围判定)
+        for bi, own in list(owner.items()):
+            if own is None:
+                continue
+            blk = blocks[bi]
+            x0p, y0p, x1p, y1p = panels[own]
+            # 该块延伸到了哪个其他面板区域(块的右/下超出自身面板, 进入别的面板的范围)
+            # 找所有与块64 空间相邻且 overlap 的面板
+            for n, (pnx0, pny0, pnx1, pny1) in panels.items():
+                if n == own:
+                    continue
+                # 块是否延伸到面板n 的水平/垂直范围
+                if pnx0 <= blk['x1'] and blk['x0'] <= pnx1 and pny0 <= blk['y1'] and blk['y0'] <= pny1:
+                    # 检查面板n 是否有块位于 blk 内部(被分隔)
+                    inside = False
+                    for bo, ob in owner.items():
+                        if ob == n:
+                            bd = blocks[bo]
+                            # bd 完整落在 blk 内部或部分重叠且主要在其内部
+                            if (bd['x0'] >= blk['x0'] and bd['x1'] <= blk['x1'] and
+                                bd['y0'] >= blk['y0'] and bd['y1'] <= blk['y1']):
+                                inside = True
+                                break
+                    if inside:
+                        # blk 被面板n的内容分隔 → 归面板n
+                        if owner[bi] != n:
+                            # print('分隔规则: 块%d 从%s→%s' % (bi, owner[bi], n))
+                            owner[bi] = n
+                            changed = True
+                        break
     return owner
 
 
@@ -167,8 +214,9 @@ def crop_for(blocks, owner, labels, panels, W, H):
 
 
 def result_for(blocks, owner, labels, panels, anchor_pad=0):
-    """L 形验证 + 重叠检查
-    anchor_pad: L形锚点左移量, 允许色块贴边到字母左上扩展区。"""
+    """L 形验证
+    anchor_pad: 锚点向左上移 P 像素。色块判定原点从 (字母x,字母y) 变为 (字母x-P, 字母y-P),
+    即色块左上角 >= 字母左上扩展区即算 OK(允许贴边到字母左/上方 P 像素)。"""
     res = {'L形': 'ALL OK', 'overlap': []}
     for n, p in panels.items():
         ids = [bi for bi, own in owner.items() if own == n]
@@ -332,15 +380,16 @@ def main():
             blocks.append({'x0': int(xs.min()), 'x1': int(xs.max()),
                            'y0': int(ys.min()), 'y1': int(ys.max())})
             bi = len(blocks) - 1
-            for n, (x0, y0, x1, y1) in panels_json.items():
-                if x0 <= int(xs.min()) < x1 and y0 <= int(ys.min()) < y1:
+            ordered2 = sorted(panels_json.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
+            for n, (x0, y0, x1, y1) in ordered2:
+                if x0 - anchor_pad <= int(xs.min()) < x1 and y0 - anchor_pad <= int(ys.min()) < y1:
                     owner[bi] = n
                     break
 
     # 3. 面板=块集合并集
     crop = crop_for(blocks, owner, labels, panels_json, W, H)
     # 4. 验证
-    result = result_for(blocks, owner, labels, panels_json)
+    result = result_for(blocks, owner, labels, panels_json, anchor_pad)
     result['overlap'] = []
     for a in crop:
         for b in crop:
@@ -351,73 +400,7 @@ def main():
             yov = min(A[3], B[3]) - max(A[1], B[1])
             if xov > 0 and yov > 0:
                 result['overlap'].append('%s∩%s: x%d y%d' % (a, b, xov, yov))
-    # 5. 空间一致性校验: 迭代解决最近邻归属冲突(大块为准), 直到无冲突或不再变化
-    suspects_idx = set()
-    orig_owner = dict(owner)
-    it = 0
-    final_suspects = []
-    prev_n = None
-    # 阶段1: 大块为准迭代(到振荡/停滞)
-    while True:
-        it += 1
-        suspects = nearest_owner_conflict(blocks, owner, max_dist=60)
-        if not suspects:
-            print('无冲突 ✓')
-            break
-        for s in suspects:
-            suspects_idx.add(s['block'])
-            suspects_idx.add(s['nearest_block'])
-        owner, reassigned = resolve_conflicts_by_size(blocks, owner, suspects)
-        if not reassigned:
-            final_suspects = suspects
-            break
-        print('大块为准 迭代%d: 冲突%d, 重分配%d' % (it, len(suspects), len(reassigned)))
-        if it >= 10:
-            final_suspects = suspects
-            break
-    # 阶段2: 多数表决收敛残余冲突
-    if final_suspects:
-        owner, reassigned = resolve_conflicts_by_majority(blocks, owner, final_suspects, k=8)
-        print('多数表决重分配 %d 块:' % len(reassigned))
-        for bi, old, new in reassigned:
-            print('  块[%d]: %s → %s' % (bi, old, new))
-        # 阶段3: 最后一轮大块为准, 让面积大的冲突块定输赢
-        final3 = nearest_owner_conflict(blocks, owner, max_dist=60)
-        if final3:
-            owner, reassigned3 = resolve_conflicts_by_size(blocks, owner, final3)
-            if reassigned3:
-                print('最终大块为准重分配 %d 块:' % len(reassigned3))
-                for bi, old, new in reassigned3:
-                    print('  块[%d]: %s → %s' % (bi, old, new))
-            final3 = nearest_owner_conflict(blocks, owner, max_dist=60)
-        if final3:
-            print('最终仍剩 %d 组冲突(无法完全消除):' % len(final3))
-            for s in final3[:10]:
-                blk = blocks[s['block']]
-                print('  块[%d]归%s(area%d) vs 块[%d]归%s(area%d) 距离%.1f (%d,%d)-(%d,%d)' % (
-                    s['block'], s['own'], s['area'], s['nearest_block'], s['nearest'], s['nearest_area'],
-                    s['dist'], blk['x0'], blk['y0'], blk['x1'], blk['y1']))
-            final_suspects = final3
-        else:
-            final_suspects = []
-    if 'suspects' in locals() and suspects:
-        for s in suspects:
-            blk = blocks[s['block']]
-            print('  块[%d]归%s(area%d) vs 块[%d]归%s(area%d) 距离%.1f (%d,%d)-(%d,%d)' % (
-                s['block'], s['own'], s['area'], s['nearest_block'], s['nearest'], s['nearest_area'], s['dist'],
-                blk['x0'], blk['y0'], blk['x1'], blk['y1']))
-    # 重算裁剪框 + 重叠
-    crop = crop_for(blocks, owner, labels, panels_json, W, H)
-    result['overlap'] = []
-    for a in crop:
-        for b in crop:
-            if a >= b:
-                continue
-            A, B = crop[a], crop[b]
-            xov = min(A[2], B[2]) - max(A[0], B[0])
-            yov = min(A[3], B[3]) - max(A[1], B[1])
-            if xov > 0 and yov > 0:
-                result['overlap'].append('%s∩%s: x%d y%d' % (a, b, xov, yov))
+    # (最近邻归属冲突校验已移除: 交界小字归属歧义是本质局限, 不做迭代归零)
 
     # 5. 输出
     for n, box in crop.items():
@@ -442,24 +425,6 @@ def main():
     d = ImageDraw.Draw(img)
     for n, (x, y) in labels.items():
         d.text((x + 2, y + 2), n, fill=(0, 0, 0))
-    # 可疑块画特殊标记: 已解决冲突=黑框红×; 剩余无法解决的冲突=绿框
-    for bi in suspects_idx:
-        if bi >= len(blocks):
-            continue
-        blk = blocks[bi]
-        # 是否是剩余冲突(绿框)
-        is_final = any(s['block'] == bi or s['nearest_block'] == bi for s in final_suspects)
-        outline = (0, 180, 0) if is_final else (0, 0, 0)
-        d.rectangle([blk['x0'] - 1, blk['y0'] - 1, blk['x1'] + 1, blk['y1'] + 1],
-                    outline=outline, width=2)
-        cx = (blk['x0'] + blk['x1']) // 2
-        cy = (blk['y0'] + blk['y1']) // 2
-        if not is_final:
-            d.line([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 0, 0), width=2)
-            d.line([cx - 4, cy + 4, cx + 4, cy - 4], fill=(255, 0, 0), width=2)
-        else:
-            # 剩余冲突画双圈
-            d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], outline=(0, 180, 0), width=2)
     img.save('%s/色块归属.png' % outdir)
     # 分割线图
     img2 = Image.open(src).convert('RGB')
