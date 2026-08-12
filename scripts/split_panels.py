@@ -19,6 +19,7 @@ import sys
 import os
 import json
 import colorsys
+from collections import Counter
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
@@ -208,11 +209,11 @@ def build_panels_from_labels(labels, W, H, anchor_pad=0):
 
 
 def assign_by_panel_majority(blocks, panels, neighbors=6, radius=200):
-    """归属: 每个块左上角落在哪个面板框 → 归谁; 再做最近邻多数修正(边界块归其周围色块多数面板)。
+    """归属: 每个块按 bbox 左上角落在哪个面板框 → 归谁;
+    再对分界线附近色块做**最近邻多数修正**(迭代): 每个块归属改为其周围色块多数面板, 直到全部一致(连成整体)。
     blocks 索引=连通域标号, 可能含 None(面积过小的连通域, 跳过)。"""
     owner = {}
     ordered = sorted(panels.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
-    # 有效块索引列表
     valid = [bi for bi, blk in enumerate(blocks) if blk is not None]
     cent = {}
     for bi in valid:
@@ -223,30 +224,33 @@ def assign_by_panel_majority(blocks, panels, neighbors=6, radius=200):
             if x0 <= bx0 < x1 and y0 <= by0 < y1:
                 owner[bi] = n
                 break
-    # 最近邻多数修正: 每个块的归属被其邻居色块的多数面板影响
-    ref_cent = {bi: c for bi, c in cent.items() if owner.get(bi) is not None}
-    new_owner = dict(owner)
-    for bi in valid:
-        if owner.get(bi) is None:
-            continue
-        cx, cy = cent[bi]
-        dists = []
-        for j, (jx, jy) in ref_cent.items():
-            if j == bi:
+    # 迭代最近邻多数修正: 边界块归其周围色块多数面板, 直到无变化
+    for _ in range(15):
+        changed = False
+        ref_cent = {bi: c for bi, c in cent.items() if owner.get(bi) is not None}
+        for bi in valid:
+            if owner.get(bi) is None:
                 continue
-            d = (cx - jx) ** 2 + (cy - jy) ** 2
-            if d < radius * radius:
-                dists.append((d, j))
-        dists.sort()
-        neigh = dists[:neighbors]
-        if len(neigh) < 3:
-            continue
-        from collections import Counter
-        cnt = Counter(owner.get(j) for _, j in neigh)
-        majority = cnt.most_common(1)[0][0]
-        if majority is not None:
-            new_owner[bi] = majority
-    return new_owner
+            cx, cy = cent[bi]
+            dists = []
+            for j, (jx, jy) in ref_cent.items():
+                if j == bi:
+                    continue
+                d = (cx - jx) ** 2 + (cy - jy) ** 2
+                if d < radius * radius:
+                    dists.append((d, j))
+            dists.sort()
+            neigh = dists[:neighbors]
+            if len(neigh) < 3:
+                continue
+            cnt = Counter(owner.get(j) for _, j in neigh)
+            majority = cnt.most_common(1)[0][0]
+            if majority is not None and majority != owner.get(bi):
+                owner[bi] = majority
+                changed = True
+        if not changed:
+            break
+    return owner
 
 
 def assign_blocks(blocks, panels, anchor_pad=0):
@@ -349,19 +353,12 @@ def apply_anchor_pad(labels, panels, anchor_pad):
 
 
 def crop_for(blocks, owner, labels, panels, W, H):
-    """面板 = 归属它的块集合并集 bbox"""
+    """裁剪框 = 最大矩形面板框本身(非色块并集, 避免裁剪重叠/漏内容)。
+    直接返回传入的 panels(每个标签一个完整矩形面板框)。"""
     crop = {}
     for n, (x0, y0, x1, y1) in panels.items():
-        lx, ly = labels[n]
-        allx = [lx]
-        ally = [ly]
-        for bi, own in owner.items():
-            if own == n:
-                b = blocks[bi]
-                allx.extend([b['x0'], b['x1']])
-                ally.extend([b['y0'], b['y1']])
-        crop[n] = (int(max(0, min(allx) - 3)), int(max(0, min(ally) - 3)),
-                   int(min(W, max(allx) + 3)), int(min(H, max(ally) + 3)))
+        crop[n] = (int(max(0, x0)), int(max(0, y0)),
+                   int(min(W, x1)), int(min(H, y1)))
     return crop
 
 
@@ -506,7 +503,7 @@ def main():
 
     # 面板框: 无 --panels 时用最大空矩形法从标签生成
     s4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
-    content = (arr[:, :, 0] < 200) & (arr[:, :, 1] < 200) & (arr[:, :, 2] < 200)
+    content = (arr[:, :, 0] < 235) & (arr[:, :, 1] < 235) & (arr[:, :, 2] < 235)
     for n, (x, y) in labels.items():
         content[max(0, y - 5):y + 16, max(0, x - 4):x + 13] = False
     if panels_json is None:

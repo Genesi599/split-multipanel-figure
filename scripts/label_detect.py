@@ -74,6 +74,29 @@ def detect_candidates(arr, ratio=1.5, min_area=20, max_area=400):
             continue
         cands.append({'x': int(xs.min()), 'y': int(ys.min()),
                       'w': int(w), 'h': int(h), 'area': int(s)})
+
+    # 窄字母(I/J)补充搜索: 高度在标签范围、宽1-8竖窄字, 放宽孤立度(否则I/J会漏检)
+    # 用于补上高度筛+严格孤立滤掉的窄标签(如 I w3h14)
+    if cands:
+        known_h = [c['h'] for c in cands]
+        tag_h = int(np.median(known_h)) if known_h else int(body_h * ratio)
+        for i in range(1, n + 1):
+            a = int(sizes[i - 1])
+            if a < 8 or a > 200:
+                continue
+            ys, xs = np.where(lab == i)
+            h2 = ys.max() - ys.min() + 1
+            w2 = xs.max() - xs.min() + 1
+            # 竖窄字: 高接近标签高度, 宽1-8, 高/宽>=1.5
+            if not (tag_h - 3 <= h2 <= tag_h + 3 and 1 <= w2 <= 8):
+                continue
+            if h2 < w2 * 1.5:
+                continue
+            # 已在候选? (按位置去重)
+            if any(abs(c['x'] - xs.min()) <= 2 and abs(c['y'] - ys.min()) <= 2 for c in cands):
+                continue
+            cands.append({'x': int(xs.min()), 'y': int(ys.min()),
+                          'w': int(w2), 'h': int(h2), 'area': a})
     return body_h, cands
 
 
