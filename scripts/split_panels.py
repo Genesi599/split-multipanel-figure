@@ -149,6 +149,49 @@ def assign_blocks(blocks, panels, anchor_pad=0):
     return owner
 
 
+def fix_L_violations(blocks, owner, labels, panels, anchor_pad=0, max_iter=20):
+    """自动修复 L 形违规: 某面板有色块超到字母左/上方(L形FAIL)时, 把这些超界块重新归属,
+    归到能包含该块左上角且满足自身L形的其他面板。迭代到 L形 ALL OK 或无法再改进。"""
+    for it in range(max_iter):
+        fixed = False
+        # 对每个面板检查 L 形
+        for n in panels:
+            if owner.get(n) is None and not any(o == n for o in owner.values()):
+                pass
+            ids = [bi for bi, o in owner.items() if o == n]
+            if not ids:
+                continue
+            lx, ly = labels[n]
+            # 找超界块(左上角 < 字母锚点)
+            for bi in ids:
+                blk = blocks[bi]
+                if blk['x0'] >= lx - anchor_pad and blk['y0'] >= ly - anchor_pad:
+                    continue
+                # 此块超界 → 移出, 重新归属
+                # 找能包含它且满足L形的面板
+                bx0, by0 = blk['x0'], blk['y0']
+                candidate = None
+                for m in panels:
+                    if m == n:
+                        continue
+                    mx0, my0, mx1, my1 = panels[m]
+                    mlx, mly = labels[m]
+                    if mx0 - anchor_pad <= bx0 < mx1 and my0 - anchor_pad <= by0 < my1:
+                        if bx0 >= mlx - anchor_pad and by0 >= mly - anchor_pad:
+                            candidate = m
+                            break
+                if candidate:
+                    owner[bi] = candidate
+                    fixed = True
+                else:
+                    owner[bi] = None  # 无法归入任何面板, 标记无归属
+                    fixed = True
+                break  # 每次只改一个, 下轮再检查, 避免连锁错乱
+        if not fixed:
+            break
+    return owner
+
+
 def apply_separation_rule(blocks, owner, panels):
     """分隔规则(硬判据): 被其他子图色块分隔的右侧/下方色块, 归分隔它的面板。
     对每个块: 若它延伸到相邻面板区域(x1 超出面板右界/下界), 且该相邻面板有内容块
@@ -386,6 +429,9 @@ def main():
                     owner[bi] = n
                     break
 
+    # 2.5 自动修复L形: 超界块重新归属直到L形通过
+    owner = fix_L_violations(blocks, owner, labels, panels_json, anchor_pad)
+
     # 3. 面板=块集合并集
     crop = crop_for(blocks, owner, labels, panels_json, W, H)
     # 4. 验证
@@ -412,15 +458,31 @@ def main():
         r, g, b = colorsys.hsv_to_rgb(h, 0.75, 0.95)
         pc[n] = (int(r * 255), int(g * 255), int(b * 255))
     outarr = np.full((H, W, 3), 255, dtype=np.uint8)
+    # 按实际内容像素着色: 每个连通域像素 + 其所属块 + 所属面板
+    # block_of[i] = 连通域i 所属的合并块索引
+    block_of = [-1] * (nc + 1)
+    for bi, blk in enumerate(blocks):
+        for i in range(1, nc + 1):
+            if block_of[i] != -1:
+                continue
+            ys, xs = np.where(lab == i)
+            if ys.size == 0:
+                continue
+            # 连通域左上角落在块的bbox内 → 属于该块
+            if blk['x0'] <= int(xs.min()) <= blk['x1'] and blk['y0'] <= int(ys.min()) <= blk['y1']:
+                block_of[i] = bi
     drew = 0
-    for bi, own in owner.items():
+    for i in range(1, nc + 1):
+        bi = block_of[i]
+        if bi < 0:
+            continue
+        own = owner.get(bi)
         if own is None or own not in pc:
             continue
-        blk = blocks[bi]
-        # 填充块 bbox 区域(仅内容像素?简化: 整块矩形填色)
-        outarr[max(0, blk['y0']):blk['y1'] + 1, max(0, blk['x0']):blk['x1'] + 1] = np.array(pc[own], dtype=np.uint8)
+        ys, xs = np.where(lab == i)
+        outarr[ys, xs] = np.array(pc[own], dtype=np.uint8)
         drew += 1
-    print('色块归属图: 画了 %d 块' % drew)
+    print('色块归属图: 画了 %d 个连通域像素' % drew)
     img = Image.fromarray(outarr)
     d = ImageDraw.Draw(img)
     for n, (x, y) in labels.items():
