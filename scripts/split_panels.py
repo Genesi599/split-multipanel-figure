@@ -131,63 +131,172 @@ def merge_words(sizes_all, lab, min_area=5, gap_ratio=0.8):
     return merged, gap_thr
 
 
-def assign_blocks(blocks, panels, anchor_pad=0):
-    """每个合并块按 bbox 左上角归属面板 → {块Index: 面板名}
-    anchor_pad: 锚点向左上移 P 像素判定归属。
-    面板判定顺序: 按面板位置从右下角到左上角(先判右下方的面板)。
-    随后应用「分隔规则」: 一个块若延伸到相邻面板区域且被该面板的内容分隔, 改归该面板。"""
-    # 面板按右下角(x1+y1)从大到小排序 → 右下面板先判
-    ordered = sorted(panels.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
+def assign_blocks_by_nearest_label(blocks, labels, anchor_pad=0):
+    """直接按最近标签归属(无需面板框/分割线):
+    每个块归属到距离最近的有效标签。有效条件: 标签**不在块的右下方**即可作为候选
+    (标签 x>块x 且 y>块y 才算右下方; 其余左/上/正下/正左都不排除)。
+    从这些候选中取距离最近的。"""
     owner = {}
     for bi, blk in enumerate(blocks):
-        bx0, by0 = blk['x0'], blk['y0']
-        for n, (x0, y0, x1, y1) in ordered:
-            if x0 - anchor_pad <= bx0 < x1 and y0 - anchor_pad <= by0 < y1:
-                owner[bi] = n
-                break
-    apply_separation_rule(blocks, owner, panels)
+        cx = (blk['x0'] + blk['x1']) / 2.0
+        cy = (blk['y0'] + blk['y1']) / 2.0
+        best = None
+        bd = 1e18
+        for n, (lx, ly) in labels.items():
+            # 排除右下方: 标签在块右下角(标签x>块中心x 且 标签y>块中心y)
+            if lx > cx and ly > cy:
+                continue
+            d = (cx - lx) ** 2 + (cy - ly) ** 2
+            if d < bd:
+                bd = d
+                best = n
+        owner[bi] = best
     return owner
 
 
-def fix_L_violations(blocks, owner, labels, panels, anchor_pad=0, max_iter=20):
-    """自动修复 L 形违规: 某面板有色块超到字母左/上方(L形FAIL)时, 把这些超界块重新归属,
-    归到能包含该块左上角且满足自身L形的其他面板。迭代到 L形 ALL OK 或无法再改进。"""
+def max_empty_rect(ax, ay, drawn, H, W):
+    """从锚点(ax,ay)到图右下角范围内, 扣除已画矩形(drawn内部), 找面积最大的空矩形。
+    返回 (x0, y0, x1, y1)。实现: 在锚点右下区域做行直方图最大矩形(仅扫锚点以下区域)。
+    顺序: 先下后上(y降序), 同y先右后左(x降序) 逐个面板。"""
+    # 构建锚点右下区域的占用掩码(仅 ay..H, ax..W)
+    occ = np.zeros((H, W), dtype=bool)
+    for (dx0, dy0, dx1, dy1) in drawn:
+        occ[max(ay, dy0):min(H, dy1), max(ax, dx0):min(W, dx1)] = True
+    # 限制扫描范围, 避免全图O(H*W)每面板
+    rowcrop = occ[ay:H, ax:W]
+    rh, rw = rowcrop.shape
+    if rh == 0 or rw == 0:
+        return (ax, ay, W, H)
+    best_area = 0
+    best = (ax, ay, W, H)
+    heights = np.zeros(rw, dtype=int)
+    for ri in range(rh):
+        heights = np.where(rowcrop[ri], 0, heights + 1)
+        # 单调栈在 ri 行找最大矩形
+        stack = []
+        for ci in range(rw + 1):
+            h = heights[ci] if ci < rw else 0
+            while stack and heights[stack[-1]] > h:
+                top = stack.pop()
+                top_h = heights[top]
+                left = stack[-1] + 1 if stack else 0
+                area = top_h * (ci - left)
+                if area > best_area:
+                    gx0, gy0 = ax + left, ay + ri - top_h + 1
+                    gx1, gy1 = ax + ci, ay + ri + 1
+                    best = (gx0, gy0, gx1, gy1)
+                    best_area = area
+            stack.append(ci)
+    return best
+
+
+def build_panels_from_labels(labels, W, H, anchor_pad=0):
+    """用最大空矩形方法画面板框: 每个标签一个矩形, 从(标签锚点-左上移量)向右下取最大空矩形。
+    顺序: 先下后上(y降序), 同y先右后左(x降序)。返回 {标签: (x0,y0,x1,y1)}。"""
+    order = sorted(labels.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
+    drawn = []
+    panels = {}
+    for n, (x, y) in order:
+        ax, ay = max(x - anchor_pad, 0), max(y - anchor_pad, 0)
+        x0, y0, x1, y1 = max_empty_rect(ax, ay, drawn, H, W)
+        x0 = max(x0, ax); y0 = max(y0, ay)
+        if x1 <= x0: x1 = x0 + 1
+        if y1 <= y0: y1 = y0 + 1
+        panels[n] = (int(x0), int(y0), int(x1), int(y1))
+        drawn.append((x0, y0, x1, y1))
+    return panels
+
+
+def assign_by_panel_majority(blocks, panels, neighbors=6, radius=200):
+    """归属: 每个块左上角落在哪个面板框 → 归谁; 再做最近邻多数修正(边界块归其周围色块多数面板)。
+    blocks 索引=连通域标号, 可能含 None(面积过小的连通域, 跳过)。"""
+    owner = {}
+    ordered = sorted(panels.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
+    # 有效块索引列表
+    valid = [bi for bi, blk in enumerate(blocks) if blk is not None]
+    cent = {}
+    for bi in valid:
+        blk = blocks[bi]
+        cent[bi] = ((blk['x0'] + blk['x1']) / 2, (blk['y0'] + blk['y1']) / 2)
+        bx0, by0 = blk['x0'], blk['y0']
+        for n, (x0, y0, x1, y1) in ordered:
+            if x0 <= bx0 < x1 and y0 <= by0 < y1:
+                owner[bi] = n
+                break
+    # 最近邻多数修正: 每个块的归属被其邻居色块的多数面板影响
+    ref_cent = {bi: c for bi, c in cent.items() if owner.get(bi) is not None}
+    new_owner = dict(owner)
+    for bi in valid:
+        if owner.get(bi) is None:
+            continue
+        cx, cy = cent[bi]
+        dists = []
+        for j, (jx, jy) in ref_cent.items():
+            if j == bi:
+                continue
+            d = (cx - jx) ** 2 + (cy - jy) ** 2
+            if d < radius * radius:
+                dists.append((d, j))
+        dists.sort()
+        neigh = dists[:neighbors]
+        if len(neigh) < 3:
+            continue
+        from collections import Counter
+        cnt = Counter(owner.get(j) for _, j in neigh)
+        majority = cnt.most_common(1)[0][0]
+        if majority is not None:
+            new_owner[bi] = majority
+    return new_owner
+
+
+def assign_blocks(blocks, panels, anchor_pad=0):
+    # 面板(传labels或panels) → 归属(面板框 + 最近邻多数修正)
+    if panels and all(isinstance(v, (list, tuple)) and len(v) == 2 for v in panels.values()):
+        # panels 是标签字典 → 转成面板框
+        return assign_blocks_by_nearest_label(blocks, panels, anchor_pad)
+    return assign_by_panel_majority(blocks, panels)
+
+
+def fix_L_violations(blocks, owner, labels, panels, anchor_pad=0, max_iter=30):
+    """根据 L 形标准调整归属: 某面板有色块超到标签左/上方(L形FAIL)时, 把超界块重新归属,
+    归到离它最近的、标签在其左上方(允许贴边 anchor_pad)的其他面板。迭代到 L形 ALL OK 或无法改进。"""
     for it in range(max_iter):
         fixed = False
-        # 对每个面板检查 L 形
+        changed_any = False
         for n in panels:
-            if owner.get(n) is None and not any(o == n for o in owner.values()):
-                pass
             ids = [bi for bi, o in owner.items() if o == n]
             if not ids:
                 continue
             lx, ly = labels[n]
-            # 找超界块(左上角 < 字母锚点)
             for bi in ids:
                 blk = blocks[bi]
                 if blk['x0'] >= lx - anchor_pad and blk['y0'] >= ly - anchor_pad:
                     continue
-                # 此块超界 → 移出, 重新归属
-                # 找能包含它且满足L形的面板
+                # 此块超界(左上角 < 标签) → 重新归属
+                # 用块左上角找最近的、标签在该块左上方的面板
                 bx0, by0 = blk['x0'], blk['y0']
                 candidate = None
-                for m in panels:
-                    if m == n:
-                        continue
-                    mx0, my0, mx1, my1 = panels[m]
-                    mlx, mly = labels[m]
-                    if mx0 - anchor_pad <= bx0 < mx1 and my0 - anchor_pad <= by0 < my1:
-                        if bx0 >= mlx - anchor_pad and by0 >= mly - anchor_pad:
-                            candidate = m
-                            break
+                bd = 1e18
+                for m, (mx, my) in labels.items():
+                    # 候选面板标签须在块的左上方(或贴边)
+                    if mx > bx0 + anchor_pad and my > by0 + anchor_pad:
+                        continue  # 标签在块右下方, 排除
+                    d = (bx0 - mx) ** 2 + (by0 - my) ** 2
+                    if d < bd:
+                        bd = d
+                        candidate = m
                 if candidate:
                     owner[bi] = candidate
+                    changed_any = True
                     fixed = True
                 else:
-                    owner[bi] = None  # 无法归入任何面板, 标记无归属
+                    owner[bi] = None
+                    changed_any = True
                     fixed = True
-                break  # 每次只改一个, 下轮再检查, 避免连锁错乱
+                break  # 每轮改一个, 下轮重新检查
         if not fixed:
+            break
+        if not changed_any:
             break
     return owner
 
@@ -391,43 +500,34 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     labels = json.load(open(labels_src, encoding='utf-8'))
 
-    # 1. 面板粗边界
+    # 1. 读图
     arr = load_arr(src)
     H, W, _ = arr.shape
-    content = ~((arr[:, :, 0] >= 235) & (arr[:, :, 1] >= 235) & (arr[:, :, 2] >= 235))
-    if panels_json is None:
-        panels_json = auto_panels(labels, content, H, W)
-        print('自动面板边界:')
-        for n, p in panels_json.items():
-            print('  %s: %s' % (n, p))
-    # 抠掉标签区
+
+    # 面板框: 无 --panels 时用最大空矩形法从标签生成
+    s4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    content = (arr[:, :, 0] < 200) & (arr[:, :, 1] < 200) & (arr[:, :, 2] < 200)
     for n, (x, y) in labels.items():
         content[max(0, y - 5):y + 16, max(0, x - 4):x + 13] = False
-    if dilate > 0:
-        content = ndimage.binary_dilation(content, structure=np.ones((3, 3)), iterations=dilate)
-    lab, nc = ndimage.label(content, structure=np.ones((3, 3)))
+    if panels_json is None:
+        panels_json = build_panels_from_labels(labels, W, H, anchor_pad)
+        print('最大空矩形面板框:')
+        for n, p in panels_json.items():
+            print('  %s: %s' % (n, p))
+    # 连通域: 4连通 + 阈值200(分离图形不粘连)
+    lab, nc = ndimage.label(content, structure=s4)
     sizes = ndimage.sum(content, lab, range(1, nc + 1))
 
-    # 2. 连通域 / 合并块 → 归属
-    if do_merge:
-        blocks, gap_thr = merge_words(sizes, lab)
-        print('间隙合并(阈值%spx): %d连通域 → %d块' % (gap_thr, nc, len(blocks)))
-        owner = assign_blocks(blocks, panels_json, anchor_pad)
-    else:
-        blocks = []
-        owner = {}
-        for i in range(1, nc + 1):
-            if sizes[i - 1] < 12:
-                continue
-            ys, xs = np.where(lab == i)
-            blocks.append({'x0': int(xs.min()), 'x1': int(xs.max()),
-                           'y0': int(ys.min()), 'y1': int(ys.max())})
-            bi = len(blocks) - 1
-            ordered2 = sorted(panels_json.items(), key=lambda kv: -(kv[1][2] + kv[1][3]))
-            for n, (x0, y0, x1, y1) in ordered2:
-                if x0 - anchor_pad <= int(xs.min()) < x1 and y0 - anchor_pad <= int(ys.min()) < y1:
-                    owner[bi] = n
-                    break
+    # 2. 连通域 → 块 → 归属 (块索引 == 连通域标号, 对齐绘图)
+    blocks = [None] * (nc + 1)  # 索引=连通域标号
+    for i in range(1, nc + 1):
+        if sizes[i - 1] < 5:
+            continue
+        ys, xs = np.where(lab == i)
+        blocks[i] = {'x0': int(xs.min()), 'x1': int(xs.max()),
+                     'y0': int(ys.min()), 'y1': int(ys.max())}
+    print('连通域(%d个,面积>=5)块对齐' % nc)
+    owner = assign_by_panel_majority(blocks, panels_json)
 
     # 2.5 自动修复L形: 超界块重新归属直到L形通过
     owner = fix_L_violations(blocks, owner, labels, panels_json, anchor_pad)
@@ -459,30 +559,18 @@ def main():
         pc[n] = (int(r * 255), int(g * 255), int(b * 255))
     outarr = np.full((H, W, 3), 255, dtype=np.uint8)
     # 按实际内容像素着色: 每个连通域像素 + 其所属块 + 所属面板
-    # block_of[i] = 连通域i 所属的合并块索引
-    block_of = [-1] * (nc + 1)
-    for bi, blk in enumerate(blocks):
-        for i in range(1, nc + 1):
-            if block_of[i] != -1:
-                continue
-            ys, xs = np.where(lab == i)
-            if ys.size == 0:
-                continue
-            # 连通域左上角落在块的bbox内 → 属于该块
-            if blk['x0'] <= int(xs.min()) <= blk['x1'] and blk['y0'] <= int(ys.min()) <= blk['y1']:
-                block_of[i] = bi
+    # 色块归属图: 直接按 owner 对块着色(每块=一个连通域)
     drew = 0
     for i in range(1, nc + 1):
-        bi = block_of[i]
-        if bi < 0:
-            continue
-        own = owner.get(bi)
-        if own is None or own not in pc:
+        own = owner.get(i)
+        if own is None or own not in pc or sizes[i - 1] < 5:
             continue
         ys, xs = np.where(lab == i)
+        if ys.size == 0:
+            continue
         outarr[ys, xs] = np.array(pc[own], dtype=np.uint8)
         drew += 1
-    print('色块归属图: 画了 %d 个连通域像素' % drew)
+    print('色块归属图: 画了 %d 块' % drew)
     img = Image.fromarray(outarr)
     d = ImageDraw.Draw(img)
     for n, (x, y) in labels.items():
