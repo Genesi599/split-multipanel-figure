@@ -59,10 +59,10 @@ def detect_candidates(arr, ratio=1.5, min_area=20, max_area=400):
         w = xs.max() - xs.min() + 1
         if h < min_h:
             continue
-        if not (0.6 <= h / w <= 2.2):
+        if not (h / w >= 0.6 and w <= 20):  # 高宽比只要>=0.6(排除横条), 不设上限(容纳窄I/J); 宽度只设上限
             continue
         fill = s / (w * h)
-        if not (0.25 <= fill <= 0.95):
+        if not (0.2 <= fill <= 1.0):  # 填充率: 上限放宽到1.0(容纳实心窄字母I/J, fill≈1)
             continue
         # 孤立度: 周围4px无其它暗像素
         pad = 4
