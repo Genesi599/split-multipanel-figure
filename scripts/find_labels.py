@@ -120,7 +120,11 @@ def pick_label_height(hist):
 
 
 def find_anchor_A(dark, labeled, sizes, max_x=120, max_y=100):
-    """找左上角最高孤立字母 = A 标签"""
+    """找左上角最高隔离大写字母 = A 标签
+
+    排除细长竖条/横条（轴、图例条、分隔线）——它们高度大但高宽比极端（非字母）。
+    字母高宽比通常 0.8-1.6。
+    """
     best, bh = None, 0
     for i in range(1, sizes.size + 1):
         s = int(sizes[i - 1])
@@ -133,8 +137,11 @@ def find_anchor_A(dark, labeled, sizes, max_x=120, max_y=100):
         w = xs.max() - xs.min() + 1
         if w > 60:
             continue
+        # 排除细长条（非字母）：高宽比 > 2.2 或 宽高比 > 3
+        if h / w > 2.2 or w / h > 3:
+            continue
         fill = s / (w * h)
-        if fill < 0.2:
+        if fill < 0.2 or fill > 0.9:
             continue
         if h > bh:
             bh = h
