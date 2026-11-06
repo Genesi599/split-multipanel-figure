@@ -137,6 +137,100 @@ def paint_units(out, glab, units, owners, color, loose, W, H, pad=PAINT_PAD):
     return painted
 
 
+
+def measure_label_boxes(arr, labels, thr=235):
+    """以视觉给定的标签位置为锚，量该字母**含抗锯齿**的墨迹 bbox。
+
+    验收标准（见 SKILL.md「标签框验收标准」）：
+      框线必须落在墨迹外的空白上（bbox 外扩 1px 画线），框内只能有该字母。
+    """
+    ink = (arr < thr).any(axis=2)
+    H, W = ink.shape
+    out = {}
+    ncomp = {}
+    for n, (x, y) in labels.items():
+        x0, y0 = max(0, int(x) - 4), max(0, int(y) - 4)
+        x1, y1 = min(W, int(x) + 28), min(H, int(y) + 28)
+        sub = ink[y0:y1, x0:x1]
+        lab, k = ndimage.label(sub, structure=np.ones((3, 3), bool))
+        if k == 0:
+            out[n] = [int(x), int(y), int(x) + 10, int(y) + 12]
+            continue
+        best = None
+        for i, sl in enumerate(ndimage.find_objects(lab)):
+            if sl is None:
+                continue
+            a = int((lab[sl] == i + 1).sum())
+            if a < 25:
+                continue
+            bx0, bx1 = sl[1].start + x0, sl[1].stop - 1 + x0
+            by0, by1 = sl[0].start + y0, sl[0].stop - 1 + y0
+            d = abs(bx0 - x) + abs(by0 - y)
+            if best is None or d < best[0]:
+                best = (d, bx0, by0, bx1, by1)
+        if best is None:
+            out[n] = [int(x), int(y), int(x) + 10, int(y) + 12]
+            ncomp[n] = 1
+            continue
+        _, gx0, gy0, gx1, gy1 = best
+        # 合并同组字形：括号组 (A) = ( + A + ) 三个连通域，只框一个括号是错的
+        ah = gy1 - gy0 + 1
+        comps = []
+        for i, sl in enumerate(ndimage.find_objects(lab)):
+            if sl is None:
+                continue
+            a = int((lab[sl] == i + 1).sum())
+            if a < 12:
+                continue
+            bx0, bx1 = sl[1].start + x0, sl[1].stop - 1 + x0
+            by0, by1 = sl[0].start + y0, sl[0].stop - 1 + y0
+            comps.append((bx0, by0, bx1, by1, a))
+        changed = True
+        while changed:
+            changed = False
+            cy = (gy0 + gy1) / 2.0
+            for (bx0, by0, bx1, by1, a) in comps:
+                if bx0 >= gx0 and bx1 <= gx1 and by0 >= gy0 and by1 <= gy1:
+                    continue
+                h = by1 - by0 + 1
+                if not (0.6 * ah <= h <= 1.5 * ah):
+                    continue
+                if abs((by0 + by1) / 2.0 - cy) > 5:
+                    continue
+                gap = max(bx0 - gx1, gx0 - bx1) - 1
+                if gap > 6:
+                    continue
+                gx0, gy0 = min(gx0, bx0), min(gy0, by0)
+                gx1, gy1 = max(gx1, bx1), max(gy1, by1)
+                changed = True
+        out[n] = [gx0, gy0, gx1, gy1]
+        ncomp[n] = sum(1 for (bx0, by0, bx1, by1, a) in comps
+                       if bx0 >= gx0 and bx1 <= gx1 and by0 >= gy0 and by1 <= gy1)
+        ncomp[n] = max(1, ncomp[n])
+    return out, ncomp
+
+
+def check_label_boxes(arr, boxes, expected=None, thr=235):
+    """返回 [(name, 框线压墨迹px, 框内完整连通块数, 跨框块数)]。"""
+    ink = (arr < thr).any(axis=2)
+    lab, _ = ndimage.label(ink, structure=np.ones((3, 3), bool))
+    H, W = ink.shape
+    res = []
+    for n, (x0, y0, x1, y1) in boxes.items():
+        ring = np.zeros((H, W), bool)
+        ring[max(0, y0 - 1):y1 + 2, max(0, x0 - 1):x1 + 2] = True
+        ring[y0:y1 + 1, x0:x1 + 1] = False
+        on_line = int((ink & ring).sum())
+        ids = set(np.unique(lab[y0:y1 + 1, x0:x1 + 1])) - {0}
+        full = 0
+        for i in ids:
+            ys, xs = np.where(lab == i)
+            if ys.min() >= y0 and ys.max() <= y1 and xs.min() >= x0 and xs.max() <= x1:
+                full += 1
+        res.append((n, on_line, full, len(ids) - full, (expected or {}).get(n, 1)))
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser(description="多 panel 组图拆分（视觉给区间 + 按组多数票归属 + 全墨迹上色）")
     ap.add_argument("img")
@@ -165,18 +259,30 @@ def main():
     say("图 %dx%d ；墨迹像素 %d ；panel %d（JSON 顺序即优先级）"
         % (W, H, int(strict.sum()), len(order)))
 
-    # 01 标签框预览
+    # 01 标签框预览：框 = 字母墨迹 bbox + 外扩 1px（SKILL.md「标签框验收标准」）
+    lboxes, lncomp = measure_label_boxes(orig, labels)
+    (outdir / "label_boxes.json").write_text(json.dumps(lboxes, ensure_ascii=False, indent=1), encoding="utf-8")
     pv = img.copy(); d = ImageDraw.Draw(pv)
     try:
         font = ImageFont.truetype("arial.ttf", 15)
     except Exception:
         font = ImageFont.load_default()
     for n in labels:
-        x, y = labels[n]
-        d.rectangle([max(0, x - 4), max(0, y - 4), x + 30, y + 27], outline=(220, 30, 30), width=2)
-        d.text((max(0, x - 4), y + 29), "%s(%d,%d)" % (n.lower(), x, y), fill=(220, 30, 30), font=font)
+        b = lboxes[n]
+        d.rectangle([b[0] - 1, b[1] - 1, b[2] + 1, b[3] + 1], outline=(220, 30, 30), width=1)
+        d.text((b[0], b[3] + 3), "%s" % n.lower(), fill=(220, 30, 30), font=font)
     pv.save(outdir / "01_标签框.png")
-    say("→ 01_标签框.png")
+    say("→ 01_标签框.png（框 = 字母墨迹 bbox 外扩 1px）")
+    say("")
+    say("标签框验收（① 框线压墨迹=0 ② 框内完整块=该组字形数 ③ 跨框块=0）:")
+    lbad = 0
+    for n, on_line, full, stray, exp in check_label_boxes(orig, lboxes, lncomp):
+        ok = (on_line == 0 and full == exp and stray == 0)
+        if not ok: lbad += 1
+        say("   (%s) 框 %dx%d 框线压墨迹 %d px 框内完整块 %d/%d 跨框块 %d %s"
+            % (n.lower(), lboxes[n][2] - lboxes[n][0] + 1, lboxes[n][3] - lboxes[n][1] + 1,
+               on_line, full, exp, stray, "OK" if ok else "!!"))
+    say("   标签框不合格数: %d %s" % (lbad, "OK" if lbad == 0 else "!!"))
 
     say("")
     say("区间（视觉给定）:")
@@ -289,9 +395,13 @@ def main():
     for k, n in enumerate(order):
         m3 = (best == k); a = int(m3.sum()); total += a
         ncc = ndimage.label(m3, structure=np.ones((3, 3), bool))[1]
-        if ncc != 1: bad_conn += 1
-        say("   (%s) 闭运算R=%-2d 连通块=%d 面积=%d %s"
-            % (n.lower(), used_r[n], ncc, a, "OK" if ncc == 1 else "!! 不连通"))
+        # 墨迹本身就分成多块时（如图例/标签远离主体），区域允许跟着分块
+        ink_ncc = ndimage.label(mask_by[n], structure=np.ones((3, 3), bool))[1]
+        allow = max(1, ink_ncc)
+        if ncc > allow:
+            bad_conn += 1
+        say("   (%s) 闭运算R=%-2d 区域块=%d（墨迹块=%d）面积=%d %s"
+            % (n.lower(), used_r[n], ncc, ink_ncc, a, "OK" if ncc <= allow else "!! 碎裂"))
     say("   面积合计 %d ; 全图 %d ; 差 %d %s"
         % (total, H * W, H * W - total, "OK 完全铺满" if total == H * W else "!! 漏格/叠格"))
 
@@ -312,7 +422,7 @@ def main():
 
     (outdir / "report.txt").write_text("\n".join(report), encoding="utf-8")
     print("\n报告: %s" % (outdir / "report.txt"))
-    ok = (total_miss == 0) and (total == H * W) and (bad_conn == 0) and not empty and (low == 0)
+    ok = (total_miss == 0) and (total == H * W) and (bad_conn == 0) and not empty and (low == 0) and (lbad == 0)
     print("全部检查通过" if ok else "!! 有检查项未通过，见 report.txt")
     return 0 if ok else 1
 
