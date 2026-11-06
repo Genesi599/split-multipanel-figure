@@ -139,80 +139,74 @@ def paint_units(out, glab, units, owners, color, loose, W, H, pad=PAINT_PAD):
 
 
 def measure_label_boxes(arr, labels, thr=235):
-    """以视觉给定的标签位置为锚，量该字母**含抗锯齿**的墨迹 bbox。
+    """量标签字母的墨迹 bbox（含抗锯齿）。
 
-    验收标准（见 SKILL.md「标签框验收标准」）：
-      框线必须落在墨迹外的空白上（bbox 外扩 1px 画线），框内只能有该字母。
+    做法：先在**全图**筛出「字母尺寸」的连通域（w 10–24、h 13–24、面积 ≥80），
+    再对每个给定点取最近的候选；最后按同组合并规则把 `(`+字母+`)` 并成整组。
+    只按“离点最近”取会有风险：标签旁的坐标轴、图形可能更近（实测抓到 14x3 的横线）。
     """
     ink = (arr < thr).any(axis=2)
     H, W = ink.shape
-    out = {}
-    ncomp = {}
-    for n, (x, y) in labels.items():
-        x0, y0 = max(0, int(x) - 4), max(0, int(y) - 4)
-        x1, y1 = min(W, int(x) + 28), min(H, int(y) + 28)
-        sub = ink[y0:y1, x0:x1]
-        lab, k = ndimage.label(sub, structure=np.ones((3, 3), bool))
-        if k == 0:
-            out[n] = [int(x), int(y), int(x) + 10, int(y) + 12]
+    lab, _ = ndimage.label(ink, structure=np.ones((3, 3), bool))
+    objs = ndimage.find_objects(lab)
+    cands = []
+    for i, sl in enumerate(objs):
+        if sl is None:
             continue
-        best = None
-        for i, sl in enumerate(ndimage.find_objects(lab)):
-            if sl is None:
-                continue
-            a = int((lab[sl] == i + 1).sum())
-            if a < 25:
-                continue
-            bx0, bx1 = sl[1].start + x0, sl[1].stop - 1 + x0
-            by0, by1 = sl[0].start + y0, sl[0].stop - 1 + y0
-            d = abs(bx0 - x) + abs(by0 - y)
-            if best is None or d < best[0]:
-                best = (d, bx0, by0, bx1, by1)
-        if best is None:
-            out[n] = [int(x), int(y), int(x) + 10, int(y) + 12]
+        a = int((lab[sl] == i + 1).sum())
+        w = sl[1].stop - sl[1].start
+        h = sl[0].stop - sl[0].start
+        if not (10 <= w <= 24 and 13 <= h <= 24 and a >= 80):
+            continue
+        cands.append((sl[1].start, sl[0].start, sl[1].stop - 1, sl[0].stop - 1, a))
+    out, ncomp = {}, {}
+    for n, v in labels.items():
+        if isinstance(v, (list, tuple)) and len(v) == 4 and not isinstance(v[0], (list, tuple)):
+            out[n] = [int(a) for a in v]
             ncomp[n] = 1
             continue
-        _, gx0, gy0, gx1, gy1 = best
-        # 合并同组字形：括号组 (A) = ( + A + ) 三个连通域，只框一个括号是错的
+        x, y = int(v[0]), int(v[1])
+        best = None
+        for c in cands:
+            d = (c[0] - x) ** 2 + (c[1] - y) ** 2
+            if best is None or d < best[0]:
+                best = (d, c)
+        if best is None:
+            out[n] = [x, y, x + 10, y + 12]
+            ncomp[n] = 1
+            continue
+        _d, _c0 = best
+        gx0, gy0, gx1, gy1 = _c0[0], _c0[1], _c0[2], _c0[3]
         ah = gy1 - gy0 + 1
-        comps = []
-        for i, sl in enumerate(ndimage.find_objects(lab)):
-            if sl is None:
-                continue
-            a = int((lab[sl] == i + 1).sum())
-            if a < 12:
-                continue
-            bx0, bx1 = sl[1].start + x0, sl[1].stop - 1 + x0
-            by0, by1 = sl[0].start + y0, sl[0].stop - 1 + y0
-            comps.append((bx0, by0, bx1, by1, a))
+        group = [_c0]                      # 必须是 5 元组，与 cands 同构，否则会重复计数
         changed = True
         while changed:
             changed = False
             cy = (gy0 + gy1) / 2.0
-            for (bx0, by0, bx1, by1, a) in comps:
-                if bx0 >= gx0 and bx1 <= gx1 and by0 >= gy0 and by1 <= gy1:
+            for c in cands:
+                if c in group:
                     continue
-                h = by1 - by0 + 1
+                h = c[3] - c[1] + 1
                 if not (0.6 * ah <= h <= 1.5 * ah):
                     continue
-                if abs((by0 + by1) / 2.0 - cy) > 5:
+                if abs((c[1] + c[3]) / 2.0 - cy) > 5:
                     continue
-                gap = max(bx0 - gx1, gx0 - bx1) - 1
+                gap = max(c[0] - gx1, gx0 - c[2]) - 1
                 if gap > 6:
                     continue
-                gx0, gy0 = min(gx0, bx0), min(gy0, by0)
-                gx1, gy1 = max(gx1, bx1), max(gy1, by1)
+                group.append(c)
+                gx0, gy0 = min(gx0, c[0]), min(gy0, c[1])
+                gx1, gy1 = max(gx1, c[2]), max(gy1, c[3])
                 changed = True
         out[n] = [gx0, gy0, gx1, gy1]
-        ncomp[n] = sum(1 for (bx0, by0, bx1, by1, a) in comps
-                       if bx0 >= gx0 and bx1 <= gx1 and by0 >= gy0 and by1 <= gy1)
-        ncomp[n] = max(1, ncomp[n])
+        ncomp[n] = max(1, len(group))
     return out, ncomp
 
 
 def check_label_boxes(arr, boxes, expected=None, thr=235):
     """返回 [(name, 框线压墨迹px, 框内完整连通块数, 跨框块数)]。"""
     ink = (arr < thr).any(axis=2)
+    # 连通性必须与 measure_label_boxes 一致（8 邻接），否则组内块数会对不上
     lab, _ = ndimage.label(ink, structure=np.ones((3, 3), bool))
     H, W = ink.shape
     res = []
