@@ -90,32 +90,34 @@ def group_units(strict, kernel=GROUP_KERNEL, min_area=1):
     return glab, units
 
 
-def assign_units(units, boxes, order, W, H):
-    """按「组内像素多数票」归属：统计该组墨迹像素落在哪个 panel 的区间里最多。
+def build_rid(boxes, order, W, H):
+    """按 JSON 顺序的优先级把全图划成 panel 索引图（先写者优先）。向量化，毫秒级。
 
-    用多数票而不是左上角单点，1–2 px 越界无法翻转整词。
+    范围若没铺满全图（旧范围常留外边距），用一次 EDT 把空隙并给最近的矩形，
+    保证「每个像素都有归属」，与 ink 模式的面积守恒口径一致。
     """
+    rid = np.full((H, W), -1, dtype=np.int16)
+    for k in range(len(order) - 1, -1, -1):
+        for (x0, y0, x1, y1) in boxes[order[k]]:
+            rid[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = k
+    miss = rid < 0
+    if miss.any() and (~miss).any():
+        idx = ndimage.distance_transform_edt(miss, return_distances=False, return_indices=True)
+        rid = rid[tuple(idx)]
+    return rid
+
+
+def assign_units(units, rid, order):
+    """组内像素多数票归属。用 rid 图 + bincount，避免逐像素 Python 循环（快 100×）。"""
     owner = []
-    for sl, m, a in units:
-        ys, xs = np.nonzero(m)
-        ys = ys + sl[0].start
-        xs = xs + sl[1].start
-        votes = {}
-        # 逐像素投票（组通常很小，直接算）
-        for y, x in zip(ys, xs):
-            for n in order:
-                hit = False
-                for (x0, y0, x1, y1) in boxes[n]:
-                    if x0 <= x < x1 and y0 <= y < y1:
-                        votes[n] = votes.get(n, 0) + 1
-                        hit = True
-                        break
-                if hit:
-                    break
-        if votes:
-            owner.append(max(votes, key=lambda k: (votes[k], -order.index(k))))
-        else:
+    for (sl, m, _a) in units:
+        vals = rid[sl][m]
+        vals = vals[vals >= 0]
+        if vals.size == 0:
             owner.append(None)
+            continue
+        cnt = np.bincount(vals, minlength=len(order))
+        owner.append(order[int(cnt.argmax())])
     return owner
 
 
@@ -139,26 +141,25 @@ def paint_units(out, glab, units, owners, color, loose, W, H, pad=PAINT_PAD):
 
 
 def measure_label_boxes(arr, labels, thr=235):
-    """量标签字母的墨迹 bbox（含抗锯齿）。
+    """量标签墨迹 bbox（含抗锯齿）。
 
-    做法：先在**全图**筛出「字母尺寸」的连通域（w 10–24、h 13–24、面积 ≥80），
-    再对每个给定点取最近的候选；最后按同组合并规则把 `(`+字母+`)` 并成整组。
-    只按“离点最近”取会有风险：标签旁的坐标轴、图形可能更近（实测抓到 14x3 的横线）。
+    labels 里的值可以是 bbox（[x0,y0,x1,y1]，直接用）或点（[x,y]，在此附近就近取块）。
+    就近取块后再做**同组合并**：`(A)` = `(`+`A`+`)` 三个连通域，只框一个括号会压字。
+    ⚠️ 不要在这里加“字母尺寸模板过滤”：小写/大写/裸字母三张图的字号差异很大
+       （h 12 / 17 / 23 都出现过），一加过滤就会漏掉整类标签（实测 Fig4 全部不合格）。
     """
     ink = (arr < thr).any(axis=2)
     H, W = ink.shape
     lab, _ = ndimage.label(ink, structure=np.ones((3, 3), bool))
     objs = ndimage.find_objects(lab)
-    cands = []
+    comps = []
     for i, sl in enumerate(objs):
         if sl is None:
             continue
         a = int((lab[sl] == i + 1).sum())
-        w = sl[1].stop - sl[1].start
-        h = sl[0].stop - sl[0].start
-        if not (10 <= w <= 24 and 13 <= h <= 24 and a >= 80):
+        if a < 8:
             continue
-        cands.append((sl[1].start, sl[0].start, sl[1].stop - 1, sl[0].stop - 1, a))
+        comps.append((sl[1].start, sl[0].start, sl[1].stop - 1, sl[0].stop - 1, a))
     out, ncomp = {}, {}
     for n, v in labels.items():
         if isinstance(v, (list, tuple)) and len(v) == 4 and not isinstance(v[0], (list, tuple)):
@@ -166,33 +167,38 @@ def measure_label_boxes(arr, labels, thr=235):
             ncomp[n] = 1
             continue
         x, y = int(v[0]), int(v[1])
+        # 就近取种子（窗口内、面积≥25 的最近块）
         best = None
-        for c in cands:
-            d = (c[0] - x) ** 2 + (c[1] - y) ** 2
+        for c in comps:
+            if c[4] < 25:
+                continue
+            if not (x - 6 <= c[0] <= x + 30 and y - 6 <= c[1] <= y + 30):
+                continue
+            d = abs(c[0] - x) + abs(c[1] - y)
             if best is None or d < best[0]:
                 best = (d, c)
         if best is None:
             out[n] = [x, y, x + 10, y + 12]
             ncomp[n] = 1
             continue
-        _d, _c0 = best
-        gx0, gy0, gx1, gy1 = _c0[0], _c0[1], _c0[2], _c0[3]
+        seed = best[1]
+        gx0, gy0, gx1, gy1 = seed[0], seed[1], seed[2], seed[3]
         ah = gy1 - gy0 + 1
-        group = [_c0]                      # 必须是 5 元组，与 cands 同构，否则会重复计数
+        group = [seed]
         changed = True
         while changed:
             changed = False
             cy = (gy0 + gy1) / 2.0
-            for c in cands:
+            for c in comps:
                 if c in group:
                     continue
                 h = c[3] - c[1] + 1
-                if not (0.6 * ah <= h <= 1.5 * ah):
+                if not (0.55 * ah <= h <= 1.8 * ah):
                     continue
-                if abs((c[1] + c[3]) / 2.0 - cy) > 5:
+                if abs((c[1] + c[3]) / 2.0 - cy) > 6:
                     continue
                 gap = max(c[0] - gx1, gx0 - c[2]) - 1
-                if gap > 6:
+                if gap > 7:
                     continue
                 group.append(c)
                 gx0, gy0 = min(gx0, c[0]), min(gy0, c[1])
@@ -234,6 +240,8 @@ def main():
     ap.add_argument("--check", help="逐部件覆盖率自查 json")
     ap.add_argument("--min-area", type=int, default=1, help="组最小面积，默认 1（不丢小点）")
     ap.add_argument("--no-crop", action="store_true")
+    ap.add_argument("--solid", choices=["rect", "ink"], default="rect",
+                    help="实心区域算法：rect=按精确矩形分区（默认，快且准）；ink=闭运算+最近墨迹（旧行为，慢）")
     args = ap.parse_args()
 
     outdir = pathlib.Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
@@ -286,7 +294,8 @@ def main():
 
     # ── 合并成单元 + 多数票归属 ──
     glab, units = group_units(strict, GROUP_KERNEL, args.min_area)
-    owners = assign_units(units, boxes, order, W, H)
+    rid = build_rid(boxes, order, W, H)
+    owners = assign_units(units, rid, order)
     say("")
     say("分组：%d 个单元（核 %dx%d，无最小面积过滤）；未归属 %d 个"
         % (len(units), GROUP_KERNEL[0], GROUP_KERNEL[1], sum(1 for o in owners if o is None)))
@@ -362,20 +371,35 @@ def main():
                 say("   (%s) %-14s %5.1f%% %s" % (n.lower(), tag, pct, "OK" if pct > 97 else "!! 漏"))
         say("   不达标部件数: %d %s" % (low, "OK" if low == 0 else "!!"))
 
-    # ── 实心化 + 互斥划分 ──
-    used_r = {}
-    for n, m in mask_by.items():
-        cur = m
-        for R in (4, 8, 12, 16, 20, 26, 32, 40):
-            c = ndimage.binary_closing(cur, structure=np.ones((2 * R + 1, 2 * R + 1), bool))
-            cur, used_r[n] = c, R
-            if ndimage.label(c, structure=np.ones((3, 3), bool))[1] == 1:
-                break
-    bmin = np.full((H, W), 1e18); best = np.full((H, W), -1, dtype=np.int16)
-    for k, n in enumerate(order):
-        dd = ndimage.distance_transform_edt(~mask_by[n])
-        m2 = dd < bmin
-        bmin[m2] = dd[m2]; best[m2] = k
+    # ── 实心区域 + 互斥划分 ──
+    say("")
+    if args.solid == "rect":
+        # 范围就是精确矩形（边线零墨迹）：直接按优先级分区，无重叠、面积天然守恒、毫秒级
+        best = rid
+        used_r = {n: 0 for n in order}
+        say("实心区域：rect 模式（范围即精确矩形，直接分区）")
+    else:
+        used_r = {}
+        for n in order:
+            m = mask_by[n]
+            ys, xs = np.nonzero(m)
+            if not len(ys):
+                used_r[n] = 0
+                continue
+            x0, y0 = max(0, xs.min() - 3), max(0, ys.min() - 3)
+            x1, y1 = min(W, xs.max() + 4), min(H, ys.max() + 4)
+            cur = m[y0:y1, x0:x1]
+            for R in (4, 8, 12, 16, 20, 26, 32, 40):
+                c = ndimage.binary_closing(cur, structure=np.ones((2 * R + 1, 2 * R + 1), bool))
+                cur, used_r[n] = c, R
+                if ndimage.label(c, structure=np.ones((3, 3), bool))[1] == 1:
+                    break
+        bmin = np.full((H, W), 1e18); best = np.full((H, W), -1, dtype=np.int16)
+        for k, n in enumerate(order):
+            dd = ndimage.distance_transform_edt(~mask_by[n])
+            m2 = dd < bmin
+            bmin[m2] = dd[m2]; best[m2] = k
+        say("实心区域：ink 模式（闭运算 + 最近墨迹划分）")
 
     solid = orig.copy()
     for k, n in enumerate(order):
@@ -385,19 +409,46 @@ def main():
 
     say("")
     say("实心区域 + 面积守恒终检:")
+    if args.solid == "rect":
+        covered = np.zeros((H, W), bool)
+        for n in order:
+            for (x0, y0, x1, y1) in as_boxes(panels[n]):
+                covered[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
+        union_cov = int(covered.sum())
+        covered = rid >= 0          # 最终分区（空隙已由最近矩形填充）
+        ov = 0
+        for i, a in enumerate(order):
+            for b in order[i + 1:]:
+                for (ax0, ay0, ax1, ay1) in as_boxes(panels[a]):
+                    for (bx0, by0, bx1, by1) in as_boxes(panels[b]):
+                        if min(ax1, bx1) > max(ax0, bx0) and min(ay1, by1) > max(ay0, by0):
+                            ov += 1
+        if ov:
+            say("   注意：%d 对范围有交叠（按 JSON 顺序首匹配裁决，不影响结果）" % ov)
     total = 0; bad_conn = 0
     for k, n in enumerate(order):
         m3 = (best == k); a = int(m3.sum()); total += a
         ncc = ndimage.label(m3, structure=np.ones((3, 3), bool))[1]
-        # 墨迹本身就分成多块时（如图例/标签远离主体），区域允许跟着分块
         ink_ncc = ndimage.label(mask_by[n], structure=np.ones((3, 3), bool))[1]
-        allow = max(1, ink_ncc)
+        allow = max(1, ink_ncc) if args.solid == "ink" else max(1, len(as_boxes(panels[n])))
         if ncc > allow:
             bad_conn += 1
-        say("   (%s) 闭运算R=%-2d 区域块=%d（墨迹块=%d）面积=%d %s"
-            % (n.lower(), used_r[n], ncc, ink_ncc, a, "OK" if ncc <= allow else "!! 碎裂"))
-    say("   面积合计 %d ; 全图 %d ; 差 %d %s"
-        % (total, H * W, H * W - total, "OK 完全铺满" if total == H * W else "!! 漏格/叠格"))
+        say("   (%s) %s 区域块=%d 面积=%d %s"
+            % (n.lower(), ("闭运算R=%d" % used_r.get(n, 0)) if args.solid == "ink" else "矩形",
+               ncc, a, "OK" if ncc <= allow else "!! 碎裂"))
+    if args.solid == "rect":
+        cov = int(covered.sum())
+        if union_cov != H * W:
+            say("   范围并集 %d / 全图 %d（差 %d 由最近矩形填充，不影响结果）"
+                % (union_cov, H * W, H * W - union_cov))
+        say("   最终分区覆盖 %d ; 全图 %d ; 未覆盖 %d %s"
+            % (cov, H * W, H * W - cov, "OK 完全铺满" if cov == H * W else "!! 有漏区"))
+        missing = H * W - cov
+    else:
+        say("   面积合计 %d ; 全图 %d ; 差 %d %s"
+            % (total, H * W, H * W - total, "OK 完全铺满" if total == H * W else "!! 漏格/叠格"))
+        missing = H * W - total
+    say("→ 03_实心区域.png / 04_区域叠原图.png（后者最适合人眼验收）")
 
     if not args.no_crop:
         say("")
@@ -416,7 +467,7 @@ def main():
 
     (outdir / "report.txt").write_text("\n".join(report), encoding="utf-8")
     print("\n报告: %s" % (outdir / "report.txt"))
-    ok = (total_miss == 0) and (total == H * W) and (bad_conn == 0) and not empty and (low == 0) and (lbad == 0)
+    ok = (total_miss == 0) and (missing == 0) and (bad_conn == 0) and not empty and (low == 0) and (lbad == 0)
     print("全部检查通过" if ok else "!! 有检查项未通过，见 report.txt")
     return 0 if ok else 1
 

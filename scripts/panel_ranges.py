@@ -191,33 +191,44 @@ def derive(ink, lb, stack=(), row_tol=45):
     return P, rows
 
 
+def as_boxes(v):
+    if isinstance(v, (list, tuple)) and len(v) == 4 and not isinstance(v[0], (list, tuple)):
+        return [tuple(int(a) for a in v)]
+    return [tuple(int(a) for a in b) for b in v]
+
+
 def verify(ink, P, lb):
-    """返回 [(name, 问题列表)]；空列表 = 通过。"""
+    """返回 [(name, 问题列表)]；空列表 = 通过。支持一个 panel 多个矩形。"""
     H, W = ink.shape
     res = []
     for n in sorted(P):
-        x0, y0, x1, y1 = P[n]
         prob = []
-        if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
-            prob.append("范围越界/宽高非法")
-            res.append((n, prob)); continue
-        lx = int(ink[y0:y1, x0].sum()); rx = int(ink[y0:y1, min(W - 1, x1)].sum())
-        ty = int(ink[y0, x0:x1].sum()); by = int(ink[min(H - 1, y1), x0:x1].sum())
-        if lx + rx + ty + by:
-            prob.append("边界压墨迹(左%d 右%d 上%d 下%d)" % (lx, rx, ty, by))
-        a = lb[n]
-        if not (x0 <= a[0] and a[2] < x1 and y0 <= a[1] and a[3] < y1):
+        inside_any = False
+        for (x0, y0, x1, y1) in as_boxes(P[n]):
+            if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
+                prob.append("范围越界/宽高非法")
+                continue
+            lx = int(ink[y0:y1, x0].sum()); rx = int(ink[y0:y1, min(W - 1, x1)].sum())
+            ty = int(ink[y0, x0:x1].sum()); by = int(ink[min(H - 1, y1), x0:x1].sum())
+            if lx + rx + ty + by:
+                prob.append("边界压墨迹(x%d-%d y%d-%d 左%d右%d上%d下%d)" % (x0, x1, y0, y1, lx, rx, ty, by))
+            a = lb[n]
+            if x0 <= a[0] and a[2] < x1 and y0 <= a[1] and a[3] < y1:
+                inside_any = True
+        if not inside_any:
             prob.append("标签不在范围内")
-        res.append((n, prob))
-    # 重叠 + 覆盖
-    area = sum((P[n][2] - P[n][0]) * (P[n][3] - P[n][1]) for n in P)
-    if area != W * H:
-        res.append(("__global__", ["面积合计 %d ≠ 全图 %d（有重叠或漏区）" % (area, W * H)]))
-    for i, a in enumerate(sorted(P)):
-        for b in sorted(P)[i + 1:]:
-            ax0, ay0, ax1, ay1 = P[a]; bx0, by0, bx1, by1 = P[b]
-            if min(ax1, bx1) > max(ax0, bx0) and min(ay1, by1) > max(ay0, by0):
-                res.append((a + "|" + b, ["范围重叠"]))
+        if prob:
+            res.append((n, prob))
+    # 覆盖 / 重叠（按 JSON 顺序优先级）
+    own = np.full((H, W), -1, dtype=np.int16)
+    order = list(P.keys())
+    for k, n in enumerate(order):
+        for (x0, y0, x1, y1) in as_boxes(P[n]):
+            sub = own[y0:y1, x0:x1]
+            sub[sub == -1] = k
+    un = int((own == -1).sum())
+    if un:
+        res.append(("__global__", ["未覆盖像素 %d（范围没铺满全图）" % un]))
     return res
 
 
@@ -237,8 +248,8 @@ def render(arr, P, lb, out):
            (0, 150, 150), (200, 120, 0), (100, 100, 0), (0, 80, 160), (160, 0, 0)]
     names = sorted(P)
     for i, n in enumerate(names):
-        x0, y0, x1, y1 = P[n]
-        d0.rectangle([x0, y0, x1 - 1, y1 - 1], fill=PAL[i % len(PAL)] + (30,))
+        for (x0, y0, x1, y1) in as_boxes(P[n]):
+            d0.rectangle([x0, y0, x1 - 1, y1 - 1], fill=PAL[i % len(PAL)] + (30,))
     im = Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB")
     d = ImageDraw.Draw(im)
     try:
@@ -246,8 +257,8 @@ def render(arr, P, lb, out):
     except Exception:
         f = ImageFont.load_default()
     for i, n in enumerate(names):
-        x0, y0, x1, y1 = P[n]
-        d.rectangle([x0, y0, x1 - 1, y1 - 1], outline=PAL[i % len(PAL)], width=2)
+        for (x0, y0, x1, y1) in as_boxes(P[n]):
+            d.rectangle([x0, y0, x1 - 1, y1 - 1], outline=PAL[i % len(PAL)], width=2)
         a = lb[n]
         d.rectangle([a[0] - 1, a[1] - 1, a[2] + 1, a[3] + 1], outline=(0, 255, 255), width=1)
     im.save(out)
@@ -274,16 +285,29 @@ def main():
     print("  图 %dx%d ；标签 %d 个" % (W, H, len(lb)))
 
     if args.panels:
-        P = {k.upper(): [int(v) for v in json.loads(pathlib.Path(args.panels).read_text(encoding="utf-8"))[k]]
-             for k in json.loads(pathlib.Path(args.panels).read_text(encoding="utf-8"))}
+        _pj = json.loads(pathlib.Path(args.panels).read_text(encoding="utf-8"))
+        P = {k.upper(): (list(v) if isinstance(v[0], (list, tuple)) else [int(a) for a in v]) for k, v in _pj.items()}
     else:
         stack = [tuple(s.split(":")) for s in args.stack]
         P, rows = derive(ink, lb, stack, args.row_tol)
         P = {k.upper(): P[k] for k in P}
         print("  推断 %d 行：%s" % (len(rows), " | ".join(" ".join(n.lower() for n in r) for r in rows)))
         for n in sorted(P):
-            b = P[n]
-            print("     (%s) x%d-%d y%d-%d %dx%d" % (n.lower(), b[0], b[2], b[1], b[3], b[2] - b[0], b[3] - b[1]))
+            for b in as_boxes(P[n]):
+                print("     (%s) x%d-%d y%d-%d %dx%d" % (n.lower(), b[0], b[2], b[1], b[3], b[2] - b[0], b[3] - b[1]))
+        # 自动修复：标签不在自己范围内（标签落在邻 panel 的空档里）→ 加「标签条」矩形并前置
+        strips = [n for n in P if not any(
+            b[0] <= lb[n][0] and lb[n][2] < b[2] and b[1] <= lb[n][1] and lb[n][3] < b[3]
+            for b in as_boxes(P[n]))]
+        if strips:
+            print("")
+            print("  自动修复：%s 的标签落在邻 panel 的 x 范围内，加标签条矩形并前置优先级"
+                  % " ".join(n.lower() for n in sorted(strips)))
+            for n in strips:
+                a = lb[n]
+                strip = [a[0] - 2, a[1] - 2, a[2] + 2, a[3] + 2]
+                P[n] = [strip] + as_boxes(P[n])
+            P = {n: P[n] for n in sorted(strips)} | {n: P[n] for n in P if n not in strips}
         if args.out:
             pathlib.Path(args.out).write_text(json.dumps(P, ensure_ascii=False, indent=1), encoding="utf-8")
             print("  → %s" % args.out)
