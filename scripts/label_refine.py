@@ -189,29 +189,42 @@ def refine_regions(arr, regions, dark_thr=120, min_w=3, max_w=45, min_h=8, max_h
             # 2026-11-06 实测：直接返回该字符坐标会让框整体偏右（落在字母或右括号上）。
             # 正解：在同一行（|cy 差|<6）、同尺寸（模板）、x 间距 <10px 的相邻字符里，
             #       向左一路收集，取最左字符的 x 作为整个括号组的起点。
-            x_left = int(c[0])
-            cur = c
-            for _ in range(4):                      # 最多向左找 4 个字符
-                cand = None
-                for o in comps:
-                    if o is c:
-                        continue
-                    # ⚠️ 不能要求高度一致：实测 (a) 的「(」h=16、小写「a」h=10、「)」h=16，
-                    # 高度差不代表不同标签。改用「高度在 8-20px」（排除图内大块内容）。
-                    if not (8 <= o[3] <= 20):
-                        continue
-                    gap = cur[0] - (o[0] + o[2])
-                    oy = (o[1] + o[3] / 2.0) - (c[1] + c[3] / 2.0)
-                    if 0 < gap <= 10 and abs(oy) <= 6:
-                        if cand is None or o[0] < cand[0]:
-                            cand = o
-                if cand is None:
-                    break
-                cur = cand
-                x_left = int(cand[0])
-            x_out = x_left
-            precise[name] = [x_out, int(c[1])]
-            report[name] = {"region": [rx0, ry0, rx1, ry1], "to": [x_out, int(c[1])],
+            # 高度窗口必须**相对模板**：
+            #   小写标签 (a)：模板 h≈10，「(」「)」h≈16 → 8..20 够用
+            #   大写标签 (A)：模板 h≈22，「(」「)」h≈23 → 旧的固定 8..20 会把括号挡掉，
+            #                 导致向左收集停在字母上，整框偏右约 8px（2026-11-06 实测）
+            ht = max(1, c[3])
+            h_lo, h_hi = max(6, int(ht * 0.55)), max(10, int(ht * 1.7))
+            group = [c]
+            for direction in (-1, 1):                # 先向左、再向右收集整组
+                cur = c
+                for _ in range(4):
+                    cand = None
+                    for o in comps:
+                        if o is c or o in group:
+                            continue
+                        if not (h_lo <= o[3] <= h_hi):
+                            continue
+                        if direction < 0:
+                            gap = cur[0] - (o[0] + o[2])
+                        else:
+                            gap = o[0] - (cur[0] + cur[2])
+                        oy = (o[1] + o[3] / 2.0) - (c[1] + c[3] / 2.0)
+                        if 0 < gap <= 10 and abs(oy) <= 6:
+                            if cand is None or (o[0] < cand[0] if direction < 0 else o[0] > cand[0]):
+                                cand = o
+                    if cand is None:
+                        break
+                    group.append(cand)
+                    cur = cand
+            gx0 = min(g[0] for g in group)
+            gy0 = min(g[1] for g in group)
+            gx1 = max(g[0] + g[2] for g in group)
+            gy1 = max(g[1] + g[3] for g in group)
+            precise[name] = [int(gx0), int(gy0)]
+            report[name] = {"region": [rx0, ry0, rx1, ry1], "to": [int(gx0), int(gy0)],
+                            "box": [int(gx0), int(gy0), int(gx1), int(gy1)],
+                            "group_chars": len(group),
                             "size": [c[2], c[3]], "dist_to_center": round(d, 1),
                             "matched": True, "template": template}
         else:
@@ -222,7 +235,7 @@ def refine_regions(arr, regions, dark_thr=120, min_w=3, max_w=45, min_h=8, max_h
     return precise, report
 
 
-def render_preview(img_path, precise, pad, out_path):
+def render_preview(img_path, precise, pad, out_path, report=None):
     """把标签框画回原图：框四边各外扩 pad 像素、坐标文字放图外底部白条。
 
     这是标签验收的唯一可靠方式——只看坐标数值无法判断框是否套住字母。
@@ -239,14 +252,20 @@ def render_preview(img_path, precise, pad, out_path):
         font = ImageFont.load_default()
     colors = ["#e41a1c", "#377eb8", "#4daf4a", "#ff7f00", "#984ea3",
               "#a65628", "#f781bf", "#999999", "#66c2a5", "#fc8d62"]
-    # 标签组实际尺寸（括号组约 21x16）；外扩 pad
-    BW, BH = 21, 16
+    # 用像素测到的**真实组 bbox**画框（写死 21x16 会切掉括号，2026-11-06 实测）
     names = sorted(precise)
     for i, name in enumerate(names):
         x, y = precise[name]
         c = colors[i % len(colors)]
-        draw.rectangle([max(0, x - pad), max(0, y - pad),
-                        x + BW + pad, y + BH + pad], outline=c, width=2)
+        bx = None
+        if report and name in report and report[name].get("box"):
+            bx = report[name]["box"]
+        if bx:
+            draw.rectangle([max(0, bx[0] - pad), max(0, bx[1] - pad),
+                            bx[2] + pad, bx[3] + pad], outline=c, width=2)
+        else:
+            draw.rectangle([max(0, x - pad), max(0, y - pad),
+                            x + 21 + pad, y + 16 + pad], outline=c, width=2)
     xpos, ybase = 16, fig.size[1] + 12
     for i, name in enumerate(names):
         c = colors[i % len(colors)]
@@ -293,7 +312,7 @@ def main():
         pathlib.Path(args.out).write_text(json.dumps(precise, ensure_ascii=False), encoding="utf-8")
         print("  ✓ 已写 %s" % args.out)
         if args.preview:
-            size = render_preview(args.img, precise, args.pad, args.preview)
+            size = render_preview(args.img, precise, args.pad, args.preview, report)
             print("  ✓ 标注图 %s (%dx%d)，框外扩 %dpx" % (args.preview, size[0], size[1], args.pad))
             print("  ⚠ 必须看这张图核对每个框是否套住字母，才算完成")
         print("  下一步: python split_panels.py <img> %s --out <outdir>" % args.out)
