@@ -167,60 +167,54 @@ def count_content_hits(path, content):
 
 
 def paint_by_seam(arr, content, panels, paths):
-    """按 seam 边界把墨迹染成各 panel 的颜色（非矩形区域划分）。
+    """按 seam 边界把墨迹染色（通用：任意 panel 数、任意布局）。
 
-    划分方式：上部（横线以上）按 3 条竖线在该行 x 位置切成 4 段；下部整块归大 panel。
-    返回 (染色图数组, 每 panel 内容像素统计, 越界检查)。
+    算法：逐行扫描。每一行取出"在该行生效"的竖线，用它们把 x 轴切成若干段，
+    每段归给**包含该段中心点**的 panel 框（panels 是完全铺满的初始框）。
+    这样跨行大 panel、不规则布局都能正确处理，无需假设谁是"下方大 panel"。
     """
     H, W = content.shape
-    names = sorted(panels)
-    # panel 颜色（HSV 均匀取色，与 split_panels 一致）
     import colorsys
+    names = sorted(panels)
     colors = {}
     for i, n in enumerate(names):
         r, g, b = colorsys.hsv_to_rgb(i / len(names), 0.75, 0.95)
         colors[n] = (int(r * 255), int(g * 255), int(b * 255))
 
-    # 取竖线、横线
     v_lines = [r for r in paths.values() if r["type"] == "vertical"]
-    h_lines = [r for r in paths.values() if r["type"] == "horizontal"]
-    v_lines.sort(key=lambda r: r["ideal_x"])
-    h_lines.sort(key=lambda r: r["ideal_y"])
-
-    # 每条竖线：y → x 映射
-    vmap = []
+    # 每条竖线：(x 逐行位置, y 起, y 止)
+    vinfo = []
     for rec in v_lines:
         m = {}
         for x, y in rec["path"]:
             m.setdefault(y, x)
-        vmap.append(m)
-    hmap = {}
-    for rec in h_lines:
-        for x, y in rec["path"]:
-            hmap.setdefault(x, y)
+        vinfo.append(m)
+
+    def owner_at(x, y):
+        # 该行生效的竖线位置
+        cuts = sorted(m[y] for m in vinfo if y in m)
+        seg = sum(1 for c in cuts if x >= c)
+        # 用切段序号确定"列"，再按 x 落在哪个 panel 框判定
+        xs = [0] + [c for c in cuts] + [W]
+        if seg >= len(xs) - 1:
+            seg = len(xs) - 2
+        cx = (xs[seg] + xs[seg + 1]) // 2
+        for n in names:
+            x0, y0, x1, y1 = panels[n]
+            if x0 <= cx < x1 and y0 <= y < y1:
+                return n
+        # 兜底：按到各 panel 中心的距离
+        return min(names, key=lambda n: (
+            abs((panels[n][0] + panels[n][2]) / 2 - x) +
+            abs((panels[n][1] + panels[n][3]) / 2 - y)))
 
     out = np.full((H, W, 3), 255, dtype=np.uint8)
     stats = {n: 0 for n in names}
     ys, xs = np.where(content)
     for y, x in zip(ys, xs):
-        # 先判横线：该列的分界 y
-        hy = hmap.get(x, h_lines[0]["ideal_y"] if h_lines else H)
-        if y >= hy:
-            label = names[-1]           # 大 panel（最后一个）
-        else:
-            # 上部：按竖线在该行的 x 位置切段
-            bounds = []
-            for m in vmap:
-                bounds.append(m.get(y, -1))
-            bounds = [b for b in bounds if b >= 0]
-            bounds.sort()
-            seg = 0
-            for b in bounds:
-                if x >= b:
-                    seg += 1
-            label = names[min(seg, len(names) - 2)]
-        out[y, x] = np.array(colors[label], dtype=np.uint8)
-        stats[label] += 1
+        n = owner_at(int(x), int(y))
+        out[y, x] = np.array(colors[n], dtype=np.uint8)
+        stats[n] += 1
     return out, stats, colors
 
 
@@ -291,11 +285,13 @@ def main():
             a, b = names[i], names[j]
             ax0, ay0, ax1, ay1 = panels[a]
             bx0, by0, bx1, by1 = panels[b]
-            # 竖向共边：a 的右边 == b 的左边，且 y 范围一致
-            if abs(ax1 - bx0) <= 1 and abs(ay0 - by0) <= 1 and abs(ay1 - by1) <= 1:
-                v_cuts.append((a, b, int((ax1 + bx0) // 2), ay0, ay1))
-            elif abs(bx1 - ax0) <= 1 and abs(ay0 - by0) <= 1 and abs(ay1 - by1) <= 1:
-                v_cuts.append((b, a, int((bx1 + ax0) // 2), ay0, ay1))
+            # 竖向共边：x 相接 且 y 范围**有重叠**（跨行大 panel 只与行内 panel 部分重叠）
+            if abs(ax1 - bx0) <= 1 and min(ay1, by1) > max(ay0, by0):
+                v_cuts.append((a, b, int((ax1 + bx0) // 2),
+                               max(ay0, by0), min(ay1, by1)))
+            elif abs(bx1 - ax0) <= 1 and min(ay1, by1) > max(ay0, by0):
+                v_cuts.append((b, a, int((bx1 + ax0) // 2),
+                               max(ay0, by0), min(ay1, by1)))
             # 横向共边：上方面板底 == 下方面板顶，x 范围**只要有重叠**即可
             # （下方大 panel 通常比上方各块宽，取并集画一条贯穿线）
             elif abs(ay1 - by0) <= 1 and min(ax1, bx1) > max(ax0, bx0):
@@ -318,6 +314,21 @@ def main():
                 x_ideal = min(x_ideal, lb[0] - 1)
             fixed.append((above, below, x_ideal, ya, yb))
         v_cuts = fixed
+
+    # 同 x 的竖线合并：y 取并集（大 panel 跨多行时，同一 x 会有多段）
+    v_merged = {}
+    for above, below, x_cut, ya, yb in v_cuts:
+        if x_cut in v_merged:
+            rec = v_merged[x_cut]
+            rec["ya"] = min(rec["ya"], ya)
+            rec["yb"] = max(rec["yb"], yb)
+            if below not in rec["belows"]:
+                rec["belows"].append(below)
+        else:
+            v_merged[x_cut] = {"ya": ya, "yb": yb,
+                               "aboves": [above], "belows": [below]}
+    v_cuts = [(rec["aboves"][0], "+".join(rec["belows"]), x, rec["ya"], rec["yb"])
+              for x, rec in sorted(v_merged.items())]
 
     v_cuts.sort(key=lambda t: t[2])
     # 同 y 的横线合并：x 取并集，between 合并

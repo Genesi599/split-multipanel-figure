@@ -353,13 +353,68 @@ def apply_anchor_pad(labels, panels, anchor_pad):
 
 
 def crop_for(blocks, owner, labels, panels, W, H):
-    """裁剪框 = 最大矩形面板框本身(非色块并集, 避免裁剪重叠/漏内容)。
-    直接返回传入的 panels(每个标签一个完整矩形面板框)。"""
+    """裁剪框 = 面板归属色块并集（墨迹方法，SKILL.md §4.5）+ 标签墨迹。
+
+    2026-11-06 修正三处：
+    1. 原实现直接返回初始框（注释"非色块并集"），与 §4.5 矛盾 →
+       按标签位置生成的框会切掉内容（Figure 1 的 GAPDH 文字被截）。
+       现改为按 owner 归属取并集。
+    2. 并集只含内容块；split_panels 会把标签区域从内容掩码挖掉，
+       标签墨迹不在块里 → 先把标签 bbox 补回并集。
+    3. 并集可能越过相邻面板（归属修正导致）→ 对**重叠簇**按重叠区中点竖直/水平切开。
+       注意：不能用"标签初始框"当边界（标签位置可能落在邻面板内容范围内，会误切）。
+    """
+    # 1) 各面板原始并集
+    uni = {}
+    for n, frame in panels.items():
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for bi, blk in enumerate(blocks):
+            if blk is None or owner.get(bi) != n:
+                continue
+            xs0.append(blk['x0']); ys0.append(blk['y0'])
+            xs1.append(blk['x1']); ys1.append(blk['y1'])
+        if xs0:
+            ux0, uy0 = min(xs0), min(ys0)
+            ux1, uy1 = max(xs1) + 1, max(ys1) + 1
+            if n in labels:                      # 2) 补回标签墨迹
+                lx, ly = labels[n]
+                ux0 = min(ux0, int(lx) - 2)
+                uy0 = min(uy0, int(ly) - 2)
+            uni[n] = [int(ux0), int(uy0), int(ux1), int(uy1)]
+        else:
+            uni[n] = [int(frame[0]), int(frame[1]), int(frame[2]), int(frame[3])]
+
+    # 3) 重叠消除：两两求交，按短边方向中点切
+    names = list(uni)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            ax0, ay0, ax1, ay1 = uni[a]
+            bx0, by0, bx1, by1 = uni[b]
+            ox0, ox1 = max(ax0, bx0), min(ax1, bx1)
+            oy0, oy1 = max(ay0, by0), min(ay1, by1)
+            if ox1 <= ox0 or oy1 <= oy0:
+                continue
+            if (ox1 - ox0) <= (oy1 - oy0):       # 竖直切
+                cut = (ox0 + ox1) // 2
+                if ax0 < bx0:
+                    uni[a][2] = cut; uni[b][0] = cut
+                else:
+                    uni[b][2] = cut; uni[a][0] = cut
+            else:                                 # 水平切
+                cut = (oy0 + oy1) // 2
+                if ay0 < by0:
+                    uni[a][3] = cut; uni[b][1] = cut
+                else:
+                    uni[b][3] = cut; uni[a][1] = cut
+
     crop = {}
-    for n, (x0, y0, x1, y1) in panels.items():
-        crop[n] = (int(max(0, x0)), int(max(0, y0)),
-                   int(min(W, x1)), int(min(H, y1)))
+    for n, (x0, y0, x1, y1) in uni.items():
+        crop[n] = (int(max(0, min(x0, W - 1))), int(max(0, min(y0, H - 1))),
+                   int(max(1, min(x1, W))), int(max(1, min(y1, H))))
     return crop
+
+
 
 
 def result_for(blocks, owner, labels, panels, anchor_pad=0):
